@@ -1,0 +1,73 @@
+image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+stages:
+  - verify
+  - publish
+
+variables:
+  UV_CACHE_DIR: .uv-cache
+
+default:
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache/
+  before_script:
+    - uv sync --locked
+
+test:
+  stage: verify
+  script:
+    - uv run python -m unittest discover -s tests
+
+publish_image:
+  stage: publish
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2375"
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script: []
+  script: |
+    set -e
+    IMAGE="$CI_REGISTRY_IMAGE"
+    echo "Using registry: $CI_REGISTRY"
+    echo "Using image path: $CI_REGISTRY_IMAGE"
+    for i in $(seq 1 30); do
+      if docker info >/dev/null 2>&1; then
+        break
+      fi
+      echo "Waiting for docker:dind..."
+      sleep 2
+    done
+    docker info
+    printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      TAG="${CI_COMMIT_TAG}"
+    else
+      TAG="dev-${CI_COMMIT_SHORT_SHA}"
+    fi
+
+    docker build \
+      -t "$IMAGE:$TAG" \
+      -t "$IMAGE:latest" \
+      .
+    docker push "$IMAGE:$TAG"
+    docker push "$IMAGE:latest"
