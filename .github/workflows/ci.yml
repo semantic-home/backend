@@ -46,7 +46,7 @@ jobs:
         run: |
           IMAGE="${{ vars.REGISTRY_IMAGE }}"
           if [ -z "${IMAGE}" ]; then
-            IMAGE="registry.myhometech.de/${GITHUB_REPOSITORY,,}"
+            IMAGE="registry.myhometech.de/semantic-home/backend"
           fi
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION_TAG="${GITHUB_REF_NAME}"
