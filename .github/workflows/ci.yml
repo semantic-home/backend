@@ -116,4 +116,4 @@ jobs:
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -p "${{ secrets.DEPLOY_PORT }}" \
             "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            -- /opt/home-automation/bin/deploy-backend.sh
+            -- sudo /opt/home-automation/bin/deploy-backend.sh
