@@ -97,6 +97,24 @@ class DemoSessionRegistry:
         session.touch()
         return session
 
+    async def cleanup_idle(self, *, max_idle_seconds: float) -> int:
+        now = datetime.now(timezone.utc)
+        expired_session_ids = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if (now - session.last_touched_at).total_seconds() >= max_idle_seconds
+        ]
+        if not expired_session_ids:
+            return 0
+
+        sessions = [
+            self._sessions.pop(session_id)
+            for session_id in expired_session_ids
+            if session_id in self._sessions
+        ]
+        await asyncio.gather(*(session.shutdown() for session in sessions), return_exceptions=True)
+        return len(sessions)
+
     async def shutdown(self) -> None:
         sessions = list(self._sessions.values())
         self._sessions.clear()

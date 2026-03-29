@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict
@@ -35,14 +36,32 @@ logging.basicConfig(
 
 API_PREFIX = settings.api_prefix or ""
 OPENAPI_PATH = f"{API_PREFIX}/openapi.json" if API_PREFIX else "/openapi.json"
+DEMO_SESSION_CLEANUP_INTERVAL_S = 3600
+DEMO_SESSION_MAX_IDLE_S = 3600
+
+
+async def _run_demo_session_cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(DEMO_SESSION_CLEANUP_INTERVAL_S)
+            cleaned = await demo_sessions.cleanup_idle(max_idle_seconds=DEMO_SESSION_MAX_IDLE_S)
+            if cleaned:
+                logging.getLogger(__name__).info("Cleaned up %s idle demo session(s).", cleaned)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception("Demo session cleanup loop failed.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     watering_scheduler.start()
+    demo_session_cleanup_task = asyncio.create_task(_run_demo_session_cleanup_loop())
     try:
         yield
     finally:
+        demo_session_cleanup_task.cancel()
+        await asyncio.gather(demo_session_cleanup_task, return_exceptions=True)
         await demo_sessions.shutdown()
         await watering_scheduler.shutdown()
         await watering_runtime.shutdown()
