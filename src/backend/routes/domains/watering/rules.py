@@ -1,6 +1,7 @@
+from dataclasses import dataclass
 from typing import Dict, Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from backend.policy.watering import PolicyFact, WateringPolicyDecision, WateringRulePreview, build_watering_rule_preview
 from backend.rules_store.watering import Rule, RuleVersionConflictError
@@ -11,8 +12,18 @@ from backend.schemas.rules import (
     RuleUpsert,
     RuleView,
 )
+from backend.session_context import get_request_session_id
 
 rules_router = APIRouter()
+
+
+@dataclass(frozen=True)
+class _RuleScope:
+    entity_store: Any
+    watering_controllers: Any
+    rules_store: Any
+    watering_runtime: Any
+    watering_scheduler: Any
 
 def _to_rule_view(rule: Rule) -> RuleView:
     return RuleView(
@@ -64,24 +75,63 @@ def _to_rule_preview_view(preview: WateringRulePreview) -> RulePreviewView:
     )
 
 
+def _global_scope() -> _RuleScope:
+    from backend.__main__ import entity_store, rules_store, watering_controllers, watering_runtime, watering_scheduler
+
+    return _RuleScope(
+        entity_store=entity_store,
+        watering_controllers=watering_controllers,
+        rules_store=rules_store,
+        watering_runtime=watering_runtime,
+        watering_scheduler=watering_scheduler,
+    )
+
+
+def _demo_scope(request: Request) -> _RuleScope:
+    from backend.__main__ import demo_sessions
+
+    session = demo_sessions.get(get_request_session_id(request))
+    return _RuleScope(
+        entity_store=session.entity_store,
+        watering_controllers=session.watering_controllers,
+        rules_store=session.rules_store,
+        watering_runtime=session.watering_runtime,
+        watering_scheduler=session.watering_scheduler,
+    )
+
+
+def _scope_for_listing(request: Request) -> _RuleScope:
+    demo_scope = _demo_scope(request)
+    if demo_scope.watering_controllers.list_all() or demo_scope.rules_store.list_all():
+        return demo_scope
+    return _global_scope()
+
+
+def _scope_for_controller(request: Request, controller_id: str) -> _RuleScope:
+    demo_scope = _demo_scope(request)
+    if demo_scope.watering_controllers.get(controller_id) is not None:
+        return demo_scope
+    return _global_scope()
+
+
 @rules_router.get(
     "/domains/watering/rules",
     response_model=list[RuleView]
 )
-async def get_all_rules():
-    from backend.__main__ import rules_store
-    return [_to_rule_view(rule) for rule in rules_store.list_all()]
+async def get_all_rules(request: Request):
+    scope = _scope_for_listing(request)
+    return [_to_rule_view(rule) for rule in scope.rules_store.list_all()]
 
 
 @rules_router.get(
     "/domains/watering/controllers/{controller_id}/rule",
     response_model=RuleView
 )
-async def get_controller_rule(controller_id: str):
-    from backend.__main__ import rules_store, watering_controllers
-    rule_by_controller_id = rules_store.get(controller_id=controller_id)
+async def get_controller_rule(controller_id: str, request: Request):
+    scope = _scope_for_controller(request, controller_id)
+    rule_by_controller_id = scope.rules_store.get(controller_id=controller_id)
 
-    controller = watering_controllers.get(controller_id)
+    controller = scope.watering_controllers.get(controller_id)
     if not controller:
         raise HTTPException(status_code=404, detail=f"No controller found with id {controller_id}")
 
@@ -94,15 +144,15 @@ async def get_controller_rule(controller_id: str):
     "/domains/watering/controllers/{controller_id}/rule",
     response_model=RuleView
 )
-async def upsert_controller_rule(controller_id: str, req: RuleUpsert) -> RuleView:
-    from backend.__main__ import rules_store, watering_controllers
+async def upsert_controller_rule(controller_id: str, req: RuleUpsert, request: Request) -> RuleView:
+    scope = _scope_for_controller(request, controller_id)
 
-    controller = watering_controllers.get(controller_id)
+    controller = scope.watering_controllers.get(controller_id)
     if not controller:
         raise HTTPException(status_code=404, detail=f"No controller found with id {controller_id}")
 
     try:
-        rule = rules_store.upsert(
+        rule = scope.rules_store.upsert(
             Rule(
                 controller_id=controller_id,
                 enabled=req.enabled,
@@ -116,7 +166,7 @@ async def upsert_controller_rule(controller_id: str, req: RuleUpsert) -> RuleVie
     except RuleVersionConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    stored = rules_store.get(controller_id=rule.controller_id)
+    stored = scope.rules_store.get(controller_id=rule.controller_id)
     if stored is None:
         raise HTTPException(status_code=500, detail="Rule upsert succeeded but stored rule is missing.")
     return _to_rule_view(stored)
@@ -125,28 +175,28 @@ async def upsert_controller_rule(controller_id: str, req: RuleUpsert) -> RuleVie
     "/domains/watering/controllers/{controller_id}/rule",
     response_model=Dict[str, Any]
 )
-async def delete_controller_rule(controller_id: str) -> Dict[str, Any]:
-    from backend.__main__ import rules_store, watering_controllers
+async def delete_controller_rule(controller_id: str, request: Request) -> Dict[str, Any]:
+    scope = _scope_for_controller(request, controller_id)
 
-    controller = watering_controllers.get(controller_id)
-    rule_by_controller_id = rules_store.get(controller_id=controller_id)
+    controller = scope.watering_controllers.get(controller_id)
+    rule_by_controller_id = scope.rules_store.get(controller_id=controller_id)
 
     if not controller:
         raise HTTPException(status_code=404, detail=f"No controller found with id {controller_id}")
 
     if rule_by_controller_id is None:
         raise HTTPException(status_code=404, detail=f"No rule found for the controller with id {controller_id}")
-    rules_store.delete(controller_id)
+    scope.rules_store.delete(controller_id)
     return {"deleted": True, "controller_id": controller_id}
 
 @rules_router.post(
     "/domains/watering/controllers/{controller_id}/rule/preview",
     response_model=RulePreviewView,
 )
-async def preview_controller_rule(controller_id: str, req: RuleUpsert) -> RulePreviewView:
-    from backend.__main__ import entity_store, watering_controllers, watering_runtime, watering_scheduler
+async def preview_controller_rule(controller_id: str, req: RuleUpsert, request: Request) -> RulePreviewView:
+    scope = _scope_for_controller(request, controller_id)
 
-    controller = watering_controllers.get(controller_id)
+    controller = scope.watering_controllers.get(controller_id)
     if not controller:
         raise HTTPException(status_code=404, detail=f"No controller found with id {controller_id}")
 
@@ -160,9 +210,9 @@ async def preview_controller_rule(controller_id: str, req: RuleUpsert) -> RulePr
             action=req.action,
         ),
         controller=controller,
-        entity_store=entity_store,
-        runtime_state=watering_runtime.get_state(controller_id),
-        controller_paused=watering_scheduler.is_controller_paused(controller_id),
-        skip_next_pending=watering_scheduler.is_skip_next_pending(controller_id)
+        entity_store=scope.entity_store,
+        runtime_state=scope.watering_runtime.get_state(controller_id),
+        controller_paused=scope.watering_scheduler.is_controller_paused(controller_id),
+        skip_next_pending=scope.watering_scheduler.is_skip_next_pending(controller_id)
     )
     return _to_rule_preview_view(preview)

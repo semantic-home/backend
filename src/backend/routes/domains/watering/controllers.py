@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from backend.controller_store.watering import WateringController
+from backend.session_context import get_request_session_id
 from backend.schemas.controller import (
     WateringControllerCreate,
     WateringControllerUpdate,
@@ -15,6 +17,15 @@ from backend.schemas.controller import (
 )
 
 watering_router = APIRouter()
+
+
+@dataclass(frozen=True)
+class _StoreScope:
+    entity_store: Any
+    watering_controllers: Any
+    rules_store: Any
+    watering_runtime: Any
+    watering_scheduler: Any
 
 _PLANT_ICON_BY_KEYWORD: dict[str, str] = {
     "monstera": "leaf",
@@ -120,12 +131,11 @@ def _ensure_entities_exist(
 
 def _ensure_no_shared_actuator_conflicts(
     *,
+    controller_store: Any,
     requested_targets: frozenset[str],
     exclude_controller_id: str | None = None,
 ) -> None:
-    from backend.__main__ import watering_controllers
-
-    for existing in watering_controllers.list_all():
+    for existing in controller_store.list_all():
         if existing.controller_id == exclude_controller_id:
             continue
         overlap = requested_targets.intersection(existing.actuator_entity_ids)
@@ -139,9 +149,54 @@ def _ensure_no_shared_actuator_conflicts(
                 },
             )
 
+
+def _global_scope() -> _StoreScope:
+    from backend.__main__ import entity_store, rules_store, watering_controllers, watering_runtime, watering_scheduler
+
+    return _StoreScope(
+        entity_store=entity_store,
+        watering_controllers=watering_controllers,
+        rules_store=rules_store,
+        watering_runtime=watering_runtime,
+        watering_scheduler=watering_scheduler,
+    )
+
+
+def _demo_scope(request: Request) -> _StoreScope:
+    from backend.__main__ import demo_sessions
+
+    session = demo_sessions.get(get_request_session_id(request))
+    return _StoreScope(
+        entity_store=session.entity_store,
+        watering_controllers=session.watering_controllers,
+        rules_store=session.rules_store,
+        watering_runtime=session.watering_runtime,
+        watering_scheduler=session.watering_scheduler,
+    )
+
+
+def _scope_for_create(request: Request, *, requires_agent: bool) -> _StoreScope:
+    if requires_agent:
+        return _global_scope()
+    return _demo_scope(request)
+
+
+def _scope_for_listing(request: Request) -> _StoreScope:
+    demo_scope = _demo_scope(request)
+    if demo_scope.watering_controllers.list_all():
+        return demo_scope
+    return _global_scope()
+
+
+def _scope_for_controller(request: Request, controller_id: str) -> _StoreScope:
+    demo_scope = _demo_scope(request)
+    if demo_scope.watering_controllers.get(controller_id) is not None:
+        return demo_scope
+    return _global_scope()
+
 @watering_router.post("/domains/watering/controllers", response_model=WateringControllerView)
-async def create_controller(req: WateringControllerCreate) -> WateringControllerView:
-    from backend.__main__ import watering_controllers, entity_store
+async def create_controller(request: Request, req: WateringControllerCreate) -> WateringControllerView:
+    scope = _scope_for_create(request, requires_agent=req.requires_agent)
 
     actuator_ids, moisture_sensor_ids, plant_ids = _normalize_controller_entities(
         req.actuator_entity_ids,
@@ -150,11 +205,12 @@ async def create_controller(req: WateringControllerCreate) -> WateringController
         legacy_actuator_entity_id=req.actuator_entity_id,
     )
     _ensure_entities_exist(
-        entity_store=entity_store,
+        entity_store=scope.entity_store,
         actuator_ids=actuator_ids,
         moisture_sensor_ids=moisture_sensor_ids,
     )
     _ensure_no_shared_actuator_conflicts(
+        controller_store=scope.watering_controllers,
         requested_targets=frozenset(actuator_ids),
         exclude_controller_id=req.controller_id,
     )
@@ -170,19 +226,19 @@ async def create_controller(req: WateringControllerCreate) -> WateringController
         zone=req.zone,
         plant_ids=plant_ids,
     )
-    watering_controllers.upsert(c)
+    scope.watering_controllers.upsert(c)
     return _to_controller_view(c)
 
 
 @watering_router.put("/domains/watering/controllers/{controller_id}", response_model=WateringControllerView)
-async def update_controller(controller_id: str, req: WateringControllerUpdate) -> WateringControllerView:
-    from backend.__main__ import entity_store, watering_controllers, watering_runtime
+async def update_controller(request: Request, controller_id: str, req: WateringControllerUpdate) -> WateringControllerView:
+    scope = _scope_for_controller(request, controller_id)
 
-    existing = watering_controllers.get(controller_id)
+    existing = scope.watering_controllers.get(controller_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    runtime_state = watering_runtime.get_state(controller_id)
+    runtime_state = scope.watering_runtime.get_state(controller_id)
     if runtime_state is not None and runtime_state.mode.value not in {"OFF", "FAILED"}:
         raise HTTPException(status_code=409, detail="Controller is busy and cannot be edited right now.")
 
@@ -192,11 +248,12 @@ async def update_controller(controller_id: str, req: WateringControllerUpdate) -
         req.plant_ids,
     )
     _ensure_entities_exist(
-        entity_store=entity_store,
+        entity_store=scope.entity_store,
         actuator_ids=actuator_ids,
         moisture_sensor_ids=moisture_sensor_ids,
     )
     _ensure_no_shared_actuator_conflicts(
+        controller_store=scope.watering_controllers,
         requested_targets=frozenset(actuator_ids),
         exclude_controller_id=controller_id,
     )
@@ -212,35 +269,35 @@ async def update_controller(controller_id: str, req: WateringControllerUpdate) -
         zone=req.zone,
         plant_ids=plant_ids,
     )
-    watering_controllers.upsert(updated)
+    scope.watering_controllers.upsert(updated)
     return _to_controller_view(updated)
 
 
 @watering_router.delete("/domains/watering/controllers/{controller_id}", response_model=dict[str, Any])
-async def delete_controller(controller_id: str) -> dict[str, Any]:
-    from backend.__main__ import rules_store, watering_controllers, watering_runtime, watering_scheduler
+async def delete_controller(request: Request, controller_id: str) -> dict[str, Any]:
+    scope = _scope_for_controller(request, controller_id)
 
-    existing = watering_controllers.get(controller_id)
+    existing = scope.watering_controllers.get(controller_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    await watering_runtime.delete(controller_id)
-    rules_store.delete(controller_id)
-    watering_scheduler.delete(controller_id)
-    watering_controllers.delete(controller_id)
+    await scope.watering_runtime.delete(controller_id)
+    scope.rules_store.delete(controller_id)
+    scope.watering_scheduler.delete(controller_id)
+    scope.watering_controllers.delete(controller_id)
     return {"deleted": True, "controller_id": controller_id}
 
 @watering_router.get("/domains/watering/controllers", response_model=list[WateringControllerView])
-async def list_controllers() -> list[WateringControllerView]:
-    from backend.__main__ import watering_controllers
-    return [_to_controller_view(c) for c in watering_controllers.list_all()]
+async def list_controllers(request: Request) -> list[WateringControllerView]:
+    scope = _scope_for_listing(request)
+    return [_to_controller_view(c) for c in scope.watering_controllers.list_all()]
 
 @watering_router.get("/domains/watering/zones/{zone_id}/controllers", response_model=list[WateringControllerView])
-async def list_zone_controllers(zone_id: str) -> list[WateringControllerView]:
-    from backend.__main__ import watering_controllers
+async def list_zone_controllers(zone_id: str, request: Request) -> list[WateringControllerView]:
+    scope = _scope_for_listing(request)
     return [
         _to_controller_view(c)
-        for c in watering_controllers.list_all()
+        for c in scope.watering_controllers.list_all()
         if c.zone is not None and c.zone.zone_id == zone_id
     ]
 
@@ -248,11 +305,11 @@ async def list_zone_controllers(zone_id: str) -> list[WateringControllerView]:
     "/domains/watering/zones/{zone_id}/controllers/{controller_id}",
     response_model=WateringControllerView
 )
-async def get_controller_per_zone(zone_id: str, controller_id: str) -> WateringControllerView:
-    from backend.__main__ import watering_controllers
+async def get_controller_per_zone(zone_id: str, controller_id: str, request: Request) -> WateringControllerView:
+    scope = _scope_for_controller(request, controller_id)
     controllers = [
         c
-        for c in watering_controllers.list_all()
+        for c in scope.watering_controllers.list_all()
         if c.zone is not None and c.zone.zone_id == zone_id and c.controller_id == controller_id
     ]
 
@@ -264,20 +321,21 @@ async def get_controller_per_zone(zone_id: str, controller_id: str) -> WateringC
     return _to_controller_view(controllers[0])
 
 @watering_router.get("/domains/watering/controllers/{controller_id}/why", response_model=WateringWhyView)
-async def why_controller(controller_id: str) -> WateringWhyView:
-    from backend.__main__ import entity_store, rules_store, watering_controllers, watering_runtime, watering_scheduler
+async def why_controller(controller_id: str, request: Request) -> WateringWhyView:
     from backend.semantic.watering_why import compute_watering_why
 
-    c = watering_controllers.get(controller_id)
+    scope = _scope_for_controller(request, controller_id)
+
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
     why = compute_watering_why(
         c,
-        entity_store,
-        rule=rules_store.get(controller_id),
-        runtime_state=watering_runtime.get_state(controller_id),
-        controller_paused=watering_scheduler.is_controller_paused(controller_id),
+        scope.entity_store,
+        rule=scope.rules_store.get(controller_id),
+        runtime_state=scope.watering_runtime.get_state(controller_id),
+        controller_paused=scope.watering_scheduler.is_controller_paused(controller_id),
     )
     return WateringWhyView(
         controller_id=why.controller_id,
@@ -293,65 +351,65 @@ async def why_controller(controller_id: str) -> WateringWhyView:
 
 
 @watering_router.get("/domains/watering/controllers/{controller_id}/next", response_model=WateringNextView)
-async def next_controller_run(controller_id: str) -> WateringNextView:
-    from backend.__main__ import watering_controllers, watering_scheduler
+async def next_controller_run(controller_id: str, request: Request) -> WateringNextView:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    next_view = watering_scheduler.get_state_view(controller_id)
+    next_view = scope.watering_scheduler.get_state_view(controller_id)
     return WateringNextView(**next_view)
 
 
 @watering_router.post("/domains/watering/controllers/{controller_id}/pause", response_model=WateringNextView)
-async def pause_controller_schedule(controller_id: str) -> WateringNextView:
-    from backend.__main__ import watering_controllers, watering_scheduler
+async def pause_controller_schedule(controller_id: str, request: Request) -> WateringNextView:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    next_view = watering_scheduler.set_paused(controller_id, True)
+    next_view = scope.watering_scheduler.set_paused(controller_id, True)
     return WateringNextView(**next_view)
 
 
 @watering_router.post("/domains/watering/controllers/{controller_id}/resume", response_model=WateringNextView)
-async def resume_controller_schedule(controller_id: str) -> WateringNextView:
-    from backend.__main__ import watering_controllers, watering_scheduler
+async def resume_controller_schedule(controller_id: str, request: Request) -> WateringNextView:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    next_view = watering_scheduler.set_paused(controller_id, False)
+    next_view = scope.watering_scheduler.set_paused(controller_id, False)
     return WateringNextView(**next_view)
 
 
 @watering_router.post("/domains/watering/controllers/{controller_id}/skip_next", response_model=WateringNextView)
-async def skip_next_controller_run(controller_id: str) -> WateringNextView:
-    from backend.__main__ import watering_controllers, watering_scheduler
+async def skip_next_controller_run(controller_id: str, request: Request) -> WateringNextView:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    next_view = watering_scheduler.skip_next(controller_id)
+    next_view = scope.watering_scheduler.skip_next(controller_id)
     if next_view is None:
         raise HTTPException(status_code=409, detail="No upcoming scheduled run to skip.")
 
     return WateringNextView(**next_view)
 
 @watering_router.post("/domains/watering/controllers/{controller_id}/start")
-async def start_controller(controller_id: str, req: WateringStartRequest) -> dict:
-    from backend.__main__ import watering_controllers, watering_runtime
+async def start_controller(controller_id: str, req: WateringStartRequest, request: Request) -> dict:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
     try:
-        run_id = await watering_runtime.start(c, seconds=req.seconds)
+        run_id = await scope.watering_runtime.start(c, seconds=req.seconds)
     except RuntimeError as exc:
         msg = str(exc)
         if "busy" in msg:
@@ -368,15 +426,15 @@ async def start_controller(controller_id: str, req: WateringStartRequest) -> dic
 
 
 @watering_router.post("/domains/watering/controllers/{controller_id}/stop")
-async def stop_controller(controller_id: str) -> dict:
-    from backend.__main__ import watering_controllers, watering_runtime
+async def stop_controller(controller_id: str, request: Request) -> dict:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
     try:
-        run_id = await watering_runtime.stop(controller_id)
+        run_id = await scope.watering_runtime.stop(controller_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -387,13 +445,13 @@ async def stop_controller(controller_id: str) -> dict:
 
 
 @watering_router.get("/domains/watering/controllers/{controller_id}/state")
-async def controller_runtime_state(controller_id: str) -> dict:
-    from backend.__main__ import watering_controllers, watering_runtime
+async def controller_runtime_state(controller_id: str, request: Request) -> dict:
+    scope = _scope_for_controller(request, controller_id)
 
-    c = watering_controllers.get(controller_id)
+    c = scope.watering_controllers.get(controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="Unknown controller_id")
 
-    state = watering_runtime.get_state_view(controller_id)
+    state = scope.watering_runtime.get_state_view(controller_id)
     state["display_name"] = c.display_name
     return state

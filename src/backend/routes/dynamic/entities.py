@@ -2,17 +2,28 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from backend.entities_store.entities import EntityRecord
 from backend.schemas.entities import EntityView, EntityActionRequest, EntityActionResponse
 from backend.semantic.capabilities import infer_capabilities
+from backend.session_context import get_request_session_id
 
 entities_router = APIRouter()
 
+
+def _resolve_entity_store(request: Request):
+    from backend.__main__ import demo_sessions, entity_store
+
+    session = demo_sessions.get(get_request_session_id(request))
+    if session.has_demo_entities():
+        return session.entity_store
+    return entity_store
+
+
 @entities_router.get("/domains/{domain}/entities", response_model=list[EntityView])
-async def list_entities(domain: str) -> List[EntityView]:
-    from ...__main__ import entity_store
+async def list_entities(domain: str, request: Request) -> List[EntityView]:
+    entity_store = _resolve_entity_store(request)
 
     result: List[EntityView] = []
     for rec in entity_store.list_all():
@@ -37,8 +48,8 @@ async def list_entities(domain: str) -> List[EntityView]:
 
 
 @entities_router.get("/domains/{domain}/entities/{entity_id:path}", response_model=EntityView)
-async def get_entity(domain: str, entity_id: str) -> EntityView:
-    from ...__main__ import entity_store
+async def get_entity(domain: str, entity_id: str, request: Request) -> EntityView:
+    entity_store = _resolve_entity_store(request)
 
     rec: EntityRecord = entity_store.get(entity_id)
     if rec is None:

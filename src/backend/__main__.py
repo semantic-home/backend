@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from .agent_hub.agent_hub import AgentHub
 from .controller_store.watering import WateringControllerStore
+from .demo_sessions import DemoSessionRegistry
 from .entities_store.entities import EntityStore
 
 
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     try:
         yield
     finally:
+        await demo_sessions.shutdown()
         await watering_scheduler.shutdown()
         await watering_runtime.shutdown()
 
@@ -95,6 +97,7 @@ watering_scheduler: WateringRuleScheduler = WateringRuleScheduler(
     entity_store=entity_store,
     runtime=watering_runtime,
 )
+demo_sessions: DemoSessionRegistry = DemoSessionRegistry(service_caller=_ha_call_service)
 
 
 def clear_all_stores() -> None:
@@ -108,8 +111,9 @@ def clear_all_stores() -> None:
     clear_classification_overrides()
 
 
-def populate_demo_data() -> None:
+def populate_demo_data(target_store: EntityStore | None = None) -> None:
     """Seed one demo home with entities for the onboarding demo flow."""
+    entity_store = target_store or globals()["entity_store"]
     # --- Watering: one pump + one moisture sensor per plant ---
     # Naming convention: switch.{plant}_pump / sensor.{plant}_moisture
     # This lets the frontend group each pair into a per-plant controller suggestion.
