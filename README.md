@@ -81,6 +81,6 @@ The default environment variables are defined in `.env.example`.
 - controller, entity, rule, and scheduler state are currently stored in memory
 - real actuator execution depends on a connected agent that can acknowledge Home Assistant service calls
 
-Public operational notes live in [operations/README.md](/Users/iliassaymaz/PycharmProjects/home-automation/backend/operations/README.md).
+Public operational notes live in [operations/README.md].
 
 Detailed manual deploy and release notes live in the separate planning repository under `planning/operations/BACKEND_DEPLOY_RELEASE.md`.

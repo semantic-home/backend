@@ -22,34 +22,6 @@ uvicorn --factory backend.__main__:create_app --host 0.0.0.0 --port 8000
 
 This standalone run is useful for smoke testing the backend image directly. The intended alpha deployment is a shared Compose stack with the frontend.
 
-## Recommended Alpha Deployment
-
-Run backend and frontend together in one Docker Compose stack. Compose creates a default internal network automatically, and the frontend Nginx config can then resolve the backend via the service name `backend`.
-
-Example `compose.yml` at the stack root:
-
-```yaml
-services:
-  backend:
-    build: ./backend
-    env_file:
-      - ./backend/.env.alpha
-    restart: unless-stopped
-
-  frontend:
-    build: ./frontend
-    depends_on:
-      - backend
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-```
-
-Start the stack from that shared root:
-
-```bash
-docker compose up -d --build
-```
 
 ## Environment
 
