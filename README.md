@@ -1,4 +1,4 @@
-# Home Automation Backend
+# Semantic Home Backend
 
 FastAPI backend for the home automation UI. The service manages domain controllers, evaluates watering rules, schedules due runs, and forwards actuator commands to connected agents.
 
