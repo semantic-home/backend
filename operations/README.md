@@ -18,6 +18,6 @@ Public operations notes for this service. These documents describe how the backe
 ## Constraints
 
 - restarting the service clears in-memory runtime and scheduler state
-- `APP_ENV=prod` disables development seed data
+- demo seed data is session-scoped rather than startup-seeded
 - no dedicated background worker or persistent database is configured in this repo
 - scheduler timing and API availability currently share the same process lifecycle

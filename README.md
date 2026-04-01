@@ -52,8 +52,7 @@ uv run uvicorn --factory backend.__main__:create_app --reload
 ```
 
 By default the API is exposed under `/api/v1`.
-
-If `APP_ENV=dev`, the app seeds demo watering entities and controllers on startup so the frontend can be exercised immediately.
+Demo seed data is session-scoped and loaded explicitly through the frontend onboarding flow or `POST /api/v1/seed/demo`.
 
 ## API and Docs
 
@@ -70,9 +69,8 @@ uv run python -m unittest discover -s tests
 
 The default environment variables are defined in `.env.example`.
 
-- `APP_ENV=dev`: enable startup seed data for local development
-- `APP_ENV=prod`: disable startup seeding
 - `API_PREFIX=/api/v1`: mount API routes under a versioned prefix
+- `SEMANTIC_HOME_BETA_KEY=`: optional shared key for agent cloud pairing; when set, agents must present the same beta key during websocket connect
 
 ## Operations
 

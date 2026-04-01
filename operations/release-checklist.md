@@ -33,6 +33,6 @@ If the change touches rules or scheduling, also verify:
 
 ## Confirm Runtime Assumptions
 
-- `APP_ENV=prod` does not seed development data
+- demo data is still loaded explicitly per session and not implicitly at process startup
 - the frontend still reads the expected API payloads
 - if the change affects execution, a connected agent is available for end-to-end testing

@@ -20,10 +20,11 @@ uv run uvicorn --factory backend.__main__:create_app --reload
 
 By default the API is exposed under `/api/v1`.
 
-If you want seeded demo controllers and entities, use:
+If you want demo data for a local tab session, either use the frontend onboarding flow or call:
 
 ```bash
-APP_ENV=dev uv run uvicorn --factory backend.__main__:create_app --reload
+curl -X POST http://localhost:8000/api/v1/seed/demo \
+  -H 'X-Semantic-Home-Session: local-dev'
 ```
 
 ## Health and Docs

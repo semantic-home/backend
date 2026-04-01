@@ -25,14 +25,14 @@ This standalone run is useful for smoke testing the backend image directly. The 
 
 ## Environment
 
-- `APP_ENV=dev`: enables demo startup seeding
-- `APP_ENV=prod`: disables demo startup seeding
 - `API_PREFIX=/api/v1`: mounts the API under the versioned prefix
+- `SEMANTIC_HOME_BETA_KEY=`: optional shared key required for agent cloud pairing when beta access is enabled
 
 ## Operational Notes
 
 - the scheduler runs in the same process as the API service
 - a restart clears in-memory entity, rule, runtime, and scheduler state
 - real actuator execution depends on a connected agent that can acknowledge Home Assistant service calls
+- demo seed data is session-scoped and is loaded explicitly through the onboarding flow or `POST /api/v1/seed/demo`
 - this repo does not currently define a separate worker or a persistent database
 - for the alpha deployment, frontend-to-backend routing is expected to happen over the shared Compose network

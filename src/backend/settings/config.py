@@ -1,6 +1,5 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Literal
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -10,7 +9,6 @@ class Settings(BaseSettings):
     )
 
     api_prefix: str = Field(default="/api/v1")
-    app_env: Literal["dev", "prod"] = Field(default="prod")
     semantic_home_beta_key: str = Field(default="")
     # weitere Felder nach Bedarf, z. B. timeouts, topics, log-level …
 
