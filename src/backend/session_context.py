@@ -14,7 +14,11 @@ def _normalize_session_id(value: str | None) -> str:
 
 
 def get_request_session_id(request: Request) -> str:
-    return _normalize_session_id(request.headers.get(SESSION_HEADER))
+    home = getattr(request.state, "home", None)
+    if not home:
+        from fastapi import HTTPException
+        raise HTTPException(401, "An authenticated household is required")
+    return home["id"] + ":" + _normalize_session_id(request.headers.get(SESSION_HEADER))[:128]
 
 
 def get_websocket_session_id(ws: WebSocket) -> str:

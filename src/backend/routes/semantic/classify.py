@@ -42,7 +42,9 @@ def _with_sensor_suggestions(
 
 
 def _global_overrides() -> dict[str, dict[str, str]]:
-    return _classification_overrides
+    from backend.__main__ import home_scopes
+    from backend.platform.security import home_context
+    return home_scopes.get(home_context.get()).classification_overrides
 
 
 def _demo_overrides(request: Request) -> dict[str, dict[str, str]]:

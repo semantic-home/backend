@@ -9,7 +9,6 @@ from fastapi import FastAPI
 
 
 from .agent_hub.agent_hub import AgentHub
-from .controller_store.watering import WateringControllerStore
 from .demo_sessions import DemoSessionRegistry
 from .entities_store.entities import EntityStore
 
@@ -24,10 +23,12 @@ from .routes.health import health_router
 from .routes.seed import seed_router
 from .routes.semantic.classify import classify_router
 from .routes.ws.agent import agent_router
-from .rules_store.watering import RulesStore
-from .scheduler.watering import WateringRuleScheduler
 from .settings.config import settings
-from .watering_fsm import HaServiceActions, WateringRuntimeManager
+from .platform.database import Database
+from .platform.legacy import HomeScopes, ScopedProxy
+from .platform.security import HouseholdMiddleware, home_context
+from .platform.service import AutomationService
+from .platform.routes import router as platform_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,23 +55,37 @@ async def _run_demo_session_cleanup_loop() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # noqa: ARG001
-    watering_scheduler.start()
-    demo_session_cleanup_task = asyncio.create_task(_run_demo_session_cleanup_loop())
+async def lifespan(app: FastAPI):
+    global home_scopes
+    db = app.state.db
+    await asyncio.to_thread(db.open)
+    runtime_connection = await asyncio.to_thread(db.acquire_runtime_lock)
+    home_scopes = HomeScopes(db, agent_hub)
+    app.state.home_scopes = home_scopes
+    db.execute("UPDATE devices SET available=false")
+    for home in db.all("SELECT DISTINCT home_id FROM legacy_objects WHERE kind IN ('controller','rule')"):
+        home_scopes.get(home["home_id"])
+    cleanup = asyncio.create_task(_run_demo_session_cleanup_loop())
     try:
         yield
     finally:
-        demo_session_cleanup_task.cancel()
-        await asyncio.gather(demo_session_cleanup_task, return_exceptions=True)
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
         await demo_sessions.shutdown()
-        await watering_scheduler.shutdown()
-        await watering_runtime.shutdown()
+        await home_scopes.shutdown()
+        await agent_hub.shutdown()
+        await asyncio.to_thread(db.release_runtime_lock, runtime_connection)
+        await asyncio.to_thread(db.close)
 
 
-def create_app():
-    _seed_dev_data_if_enabled()
+def create_app(database_url: str | None = None):
 
     app = FastAPI(title="HA Backend", lifespan=lifespan, openapi_url=OPENAPI_PATH)
+    app.state.db = Database(database_url or settings.database_url)
+    app.state.agent_hub = agent_hub
+    app.state.automations = AutomationService(app.state.db, agent_hub)
+    app.add_middleware(HouseholdMiddleware)
+    app.include_router(platform_router, prefix=API_PREFIX, tags=["households", "automations"])
     app.include_router(health_router, prefix=f"{API_PREFIX}", tags=["health"])
     app.include_router(agent_router, prefix=f"{API_PREFIX}", tags=["ws", "agent"])
     app.include_router(command_router, prefix=f"{API_PREFIX}", tags=["command"])
@@ -86,48 +101,27 @@ def create_app():
 
 agent_hub: AgentHub = AgentHub()
 
-entity_store: EntityStore = EntityStore()
-watering_controllers: WateringControllerStore = WateringControllerStore()
-rules_store: RulesStore = RulesStore()
+home_scopes: HomeScopes
+entity_store = ScopedProxy("entity_store")
+watering_controllers = ScopedProxy("watering_controllers")
+rules_store = ScopedProxy("rules_store")
+watering_runtime = ScopedProxy("watering_runtime")
+watering_scheduler = ScopedProxy("watering_scheduler")
+
 async def _ha_call_service(agent_id: str, ha_domain: str, ha_service: str, data: Dict[str, Any]) -> None:
+    if not home_scopes.db.agent(home_context.get(), agent_id):
+        raise RuntimeError("Agent does not belong to this authenticated household")
     cmd = await agent_hub.send_command_and_wait_ack(
         agent_id=agent_id,
         name="ha.call_service",
         args={"domain": ha_domain, "service": ha_service, "data": data},
-        timeout_s=300.0,
+        timeout_s=10.0,
     )
     if not cmd.ok:
         raise RuntimeError(cmd.error or "Unknown error from agent")
 
 
-async def _observe_watering_state(entity_id: str, state: str) -> None:
-    await watering_runtime.observe_entity_state(entity_id, state)
-
-
-watering_runtime: WateringRuntimeManager = WateringRuntimeManager(
-    actions=HaServiceActions(
-        service_caller=_ha_call_service,
-        state_observer=_observe_watering_state,
-    ),
-)
-watering_scheduler: WateringRuleScheduler = WateringRuleScheduler(
-    rules_store=rules_store,
-    controller_store=watering_controllers,
-    entity_store=entity_store,
-    runtime=watering_runtime,
-)
 demo_sessions: DemoSessionRegistry = DemoSessionRegistry(service_caller=_ha_call_service)
-
-
-def clear_all_stores() -> None:
-    """Clear every in-memory store (entities, controllers, rules, scheduler, overrides)."""
-    from .routes.semantic.classify import clear_classification_overrides
-
-    entity_store.clear()
-    watering_controllers.clear()
-    rules_store.clear()
-    watering_scheduler.clear()
-    clear_classification_overrides()
 
 
 def populate_demo_data(target_store: EntityStore | None = None) -> None:
@@ -423,8 +417,3 @@ def populate_demo_data(target_store: EntityStore | None = None) -> None:
         },
         source="seed",
     )
-
-
-def _seed_dev_data_if_enabled() -> None:
-    """On startup: clear stores without injecting demo data into the live install flow."""
-    clear_all_stores()

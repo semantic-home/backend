@@ -226,6 +226,17 @@ async def create_controller(request: Request, req: WateringControllerCreate) -> 
         zone=req.zone,
         plant_ids=plant_ids,
     )
+    if req.requires_agent:
+        for entity_id in actuator_ids + moisture_sensor_ids:
+            rec = scope.entity_store.get(entity_id)
+            if not rec or rec.source_id != req.agent_id:
+                raise HTTPException(422, "All selected entities must belong to this household's selected agent")
+        selected = request.app.state.db.all("SELECT id FROM devices WHERE home_id=%s AND agent_id=%s AND entity_id=ANY(%s)",
+            (request.state.home["id"], req.agent_id, actuator_ids))
+        for rule in request.app.state.db.all("SELECT deployed_spec,spec,requested FROM automations WHERE home_id=%s AND status<>'deleted'", (request.state.home["id"],)):
+            for spec in [rule["deployed_spec"], rule["spec"] if rule["requested"] else None]:
+                if spec and spec["enabled"] and set(spec["targets"]).intersection(d["id"] for d in selected):
+                    raise HTTPException(409, "Pause the existing automation before assigning these actuators")
     scope.watering_controllers.upsert(c)
     return _to_controller_view(c)
 
@@ -269,6 +280,17 @@ async def update_controller(request: Request, controller_id: str, req: WateringC
         zone=req.zone,
         plant_ids=plant_ids,
     )
+    if req.requires_agent:
+        for entity_id in actuator_ids + moisture_sensor_ids:
+            rec = scope.entity_store.get(entity_id)
+            if not rec or rec.source_id != req.agent_id:
+                raise HTTPException(422, "All selected entities must belong to this household's selected agent")
+        selected = request.app.state.db.all("SELECT id FROM devices WHERE home_id=%s AND agent_id=%s AND entity_id=ANY(%s)",
+            (request.state.home["id"], req.agent_id, actuator_ids))
+        for rule in request.app.state.db.all("SELECT deployed_spec,spec,requested FROM automations WHERE home_id=%s AND status<>'deleted'", (request.state.home["id"],)):
+            for spec in [rule["deployed_spec"], rule["spec"] if rule["requested"] else None]:
+                if spec and spec["enabled"] and set(spec["targets"]).intersection(d["id"] for d in selected):
+                    raise HTTPException(409, "Pause the existing automation before assigning these actuators")
     scope.watering_controllers.upsert(updated)
     return _to_controller_view(updated)
 
@@ -298,7 +320,7 @@ async def list_zone_controllers(zone_id: str, request: Request) -> list[Watering
     return [
         _to_controller_view(c)
         for c in scope.watering_controllers.list_all()
-        if c.zone is not None and c.zone.zone_id == zone_id
+        if (c.zone.zone_id if c.zone else "unassigned") == zone_id
     ]
 
 @watering_router.get(
@@ -310,7 +332,7 @@ async def get_controller_per_zone(zone_id: str, controller_id: str, request: Req
     controllers = [
         c
         for c in scope.watering_controllers.list_all()
-        if c.zone is not None and c.zone.zone_id == zone_id and c.controller_id == controller_id
+        if (c.zone.zone_id if c.zone else "unassigned") == zone_id and c.controller_id == controller_id
     ]
 
     if not controllers:

@@ -5,14 +5,17 @@ FastAPI backend for the home automation UI. The service manages domain controlle
 ## Responsibilities
 
 - expose REST and websocket APIs for the frontend and agents
-- store live entity state and controller definitions in memory
+- persist households, memberships, device inventory and automation versions in PostgreSQL
+- authenticate browser sessions and individually paired local agents
+- compile humidity, switching and cleaning templates into locally executed HA automations
 - evaluate watering rules through a policy layer
 - schedule due watering rules and execute them through the runtime
 - provide explainability endpoints such as `why`, `preview`, and `next`
 
 ## Core Concepts
 
-- **Controller**: a user-facing automation unit, such as a watering controller for one zone or plant group
+- **Zone**: a user-confirmed room or logical scope, optionally suggested by HA areas
+- **Controller**: a meaningful group of entities assigned to roles, belonging to a zone; its child rules define behavior
 - **Rule**: a stored schedule, condition set, and action for a controller
 - **Policy**: the decision layer that answers whether a rule should run now
 - **Scheduler**: the loop that checks due rules and triggers execution
@@ -42,13 +45,13 @@ FastAPI backend for the home automation UI. The service manages domain controlle
 
 ```bash
 cp .env.example .env
-uv sync
+uv sync --group dev
 ```
 
 ### Run
 
 ```bash
-uv run uvicorn --factory backend.__main__:create_app --reload
+uv run uvicorn --app-dir src --factory backend.__main__:create_app --reload
 ```
 
 By default the API is exposed under `/api/v1`.
@@ -62,7 +65,7 @@ Demo seed data is session-scoped and loaded explicitly through the frontend onbo
 ## Testing
 
 ```bash
-uv run python -m unittest discover -s tests
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@localhost:55432/semantic_home_test uv run --group dev python -m unittest discover -s tests
 ```
 
 ## Environment
@@ -70,15 +73,30 @@ uv run python -m unittest discover -s tests
 The default environment variables are defined in `.env.example`.
 
 - `API_PREFIX=/api/v1`: mount API routes under a versioned prefix
-- `SEMANTIC_HOME_BETA_KEY=`: optional shared key for agent cloud pairing; when set, agents must present the same beta key during websocket connect
+- `DATABASE_URL=`: PostgreSQL connection string
+- `AUTH_COOKIE_SECURE=true`: require HTTPS for session cookies in production
+- `REGISTRATION_KEY=`: registration key; required by the production Compose configuration
+- `ALLOWED_ORIGINS=`: additional explicitly allowed browser origins
+- `SEMANTIC_HOME_BETA_KEY=`: legacy setting; individual agent credentials are now required
 
 ## Operations
 
 - the backend runs as a single FastAPI application process
 - the watering scheduler runs in-process, not as a separate worker
-- controller, entity, rule, and scheduler state are currently stored in memory
+- household data, device inventory, watering definitions and watering pause/skip state are persistent
+- runtime connections and active watering FSMs are process-local; use exactly one backend worker
+- a database advisory lock prevents two backend runtimes from using the same database
+- legacy beta-key-only agents must be updated and paired with household-specific credentials
 - real actuator execution depends on a connected agent that can acknowledge Home Assistant service calls
 
 Public operational notes live in [operations/README.md].
 
 Detailed manual deploy and release notes live in the separate planning repository under `planning/operations/BACKEND_DEPLOY_RELEASE.md`.
+
+## Household automation release
+
+See [the implementation and setup guide](operations/MULTI_HOME_AUTOMATIONS.md). PostgreSQL is required; there is no SQLite fallback. Set DATABASE_URL before startup. Migrations are packaged with the application and applied transactionally at startup. The integration tests clear only an explicitly named semantic_home_test database.
+
+Existing watering definitions should be exported before replacing an old backend. Use `python -m backend.platform.migrate_legacy --help`; the import requires a selected household/agent and a stopped new backend, rejects collisions, and restores rules paused.
+
+The shared controller model and migration are described in [Controllers and zones](operations/CONTROLLERS_AND_ZONES.md). The new domain routes preserve the existing `/domains/{domain}/zones/{zone}/controllers` structure.

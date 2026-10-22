@@ -67,36 +67,11 @@ async def get_entity(domain: str, entity_id: str, request: Request) -> EntityVie
     )
 
 @entities_router.post("/domains/{domain}/entities/actions", response_model=EntityActionResponse)
-async def execute_entity_action(domain: str, req: EntityActionRequest) -> EntityActionResponse:
-    from ...__main__ import agent_hub
-    # MVP: mapping Action -> HA service call (Domain+Service+Data)
-    ent_domain = req.entity_id.split(".", 1)[0]
-
-    # nur MVP-allowlist
-    if ent_domain not in ("switch", "valve"):
-        raise HTTPException(status_code=400, detail="Entity is not controllable in MVP")
-
-    if req.action == "turn_on":
-        ha_call = {"type": "ha_call_service", "domain": ent_domain, "service": "turn_on",
-                   "data": {"entity_id": req.entity_id}}
-    elif req.action == "turn_off":
-        ha_call = {"type": "ha_call_service", "domain": ent_domain, "service": "turn_off",
-                   "data": {"entity_id": req.entity_id}}
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported action: {req.action}")
-
-    # Agent auswählen: MVP-hart (z. B. "home1"), später über site/home binding
-    agent_id = "home1"
-
-    from ...__main__ import agent_hub
-    cmd = await agent_hub.send_command_and_wait_ack(
-        agent_id=agent_id,
-        name="ha.call_service",
-        args=ha_call,
-        timeout_s=5.0,
-    )
-
-    if not cmd.ok:
-        return EntityActionResponse(ok=False, error=cmd.error)
-
-    return EntityActionResponse(ok=True, applied={"entity_id": req.entity_id, "action": req.action})
+async def execute_entity_action(domain: str, req: EntityActionRequest, request: Request):
+    from backend.platform.models import DeviceAction
+    from backend.platform.routes import device_action
+    rows = request.app.state.db.all("SELECT id FROM devices WHERE home_id=%s AND entity_id=%s", (request.state.home["id"], req.entity_id))
+    if len(rows) != 1:
+        raise HTTPException(409, "Select an unambiguous device connection")
+    result = await device_action(rows[0]["id"], DeviceAction(action=req.action), request)
+    return EntityActionResponse(ok=result["accepted"], error=result["error"])

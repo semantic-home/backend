@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 class HAEntityState(BaseModel):
-    entity_id: str
+    entity_id: str = Field(pattern=r"^[a-z0-9_]+\.[a-z0-9_]+$")
     state: str
     attributes: Dict[str, Any] = Field(default_factory=dict)
 

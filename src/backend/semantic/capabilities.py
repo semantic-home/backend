@@ -5,7 +5,7 @@ from typing import Any, Dict
 def infer_capabilities(entity_id: str, attributes: Dict[str, Any]) -> Dict[str, Any]:
     domain: str = entity_id.split(".", 1)[0]
 
-    if domain in ("switch", "valve"):
+    if domain in ("switch", "humidifier"):
         return {
             "actions": ["turn_on", "turn_off"]
         }
@@ -18,11 +18,20 @@ def infer_capabilities(entity_id: str, attributes: Dict[str, Any]) -> Dict[str, 
         }
 
     if domain == "light":
-        # MVP: nur rudimentär, später feiner (brightness/color_temp/transition)
         caps = {"actions": ["turn_on", "turn_off"]}
-        if "brightness" in attributes:
+        modes = set(attributes.get("supported_color_modes") or [])
+        if "brightness" in attributes or modes - {"onoff", "unknown"}:
             caps["brightness"] = {"supported": True}
+            caps["actions"].append("set_brightness")
         return caps
+
+    if domain == "valve":
+        return {"actions": ["open_valve", "close_valve"]}
+
+    if domain == "vacuum":
+        features = attributes.get("supported_features", 0)
+        features = features if isinstance(features, int) else 0
+        return {"actions": [name for bit, name in ((8192, "start"), (4, "pause"), (16, "return_to_base")) if features & bit]}
 
     return {
         "read_only": True
