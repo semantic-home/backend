@@ -149,7 +149,11 @@ class HouseholdIntegrationTest(unittest.TestCase):
         from backend.schemas.ha_messages import HAEntityState
         self.app.state.db.ingest(headers["x-semantic-home-household"], connection["id"], [
             HAEntityState(entity_id=entity_id, state=state, attributes=attrs or {"friendly_name": "Keller"})])
-        return self.client.get("/api/v1/devices", headers=headers).json()["items"]
+        # Entity IDs can repeat across a household's HA connections. Return the
+        # inventory for the connection populated above, not a household-wide mix.
+        response = self.client.get("/api/v1/devices", headers=headers, params={"agent_id": connection["id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["items"]
 
     def spec(self, device_id, **patch):
         return {"name": "Abendlicht", "kind": "time_window", "targets": [device_id], "start": "18:00", "end": "23:00", **patch}
@@ -455,6 +459,58 @@ class HouseholdIntegrationTest(unittest.TestCase):
         events = self.client.get('/api/v1/automation-events?controller_id=' + first['controller_id'], headers=self.alice).json()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['automation_id'], rule['id'])
+
+    def test_controller_fixtures_keep_duplicate_entity_ids_on_their_own_connection(self):
+        from unittest.mock import patch
+
+        # Give the two connections opposite inventory ordering for the plug and
+        # sensor. A household-wide first-match lookup must not wire them together.
+        device_ids = [f'00000000-0000-4000-8000-{number:012d}' for number in (1, 4, 3, 2)]
+        with patch('backend.platform.database.uid', side_effect=device_ids):
+            first, _, first_connection = self.humidity_controller()
+            second, _, second_connection = self.humidity_controller()
+
+        for controller, connection, expected_ids in (
+            (first, first_connection, (device_ids[0], device_ids[1])),
+            (second, second_connection, (device_ids[2], device_ids[3])),
+        ):
+            self.assertEqual(controller['agent_id'], connection['id'])
+            self.assertEqual(controller['bindings']['targets'], [expected_ids[0]])
+            self.assertEqual(controller['bindings']['sensor_id'], expected_ids[1])
+
+        inventory = self.client.get('/api/v1/devices', headers=self.alice).json()
+        self.assertEqual(inventory['total'], 4)
+        self.assertEqual({device['agent_id'] for device in inventory['items']},
+                         {first_connection['id'], second_connection['id']})
+
+    def test_controller_rejects_mixed_connections_and_foreign_households(self):
+        controller, body, _ = self.humidity_controller()
+        path = '/api/v1/domains/humidity/controllers'
+
+        for headers, expected_detail in (
+            (self.alice, 'same Home Assistant connection'),
+            (self.bob, 'does not belong to this household'),
+        ):
+            connection = self.connection(headers)
+            self.ingest(headers, connection, 'switch.dehumidifier')
+            inventory = self.ingest(headers, connection, 'sensor.humidity', '56',
+                                    {'device_class': 'humidity', 'unit_of_measurement': '%'})
+            plug = next(device['id'] for device in inventory if device['entity_id'] == 'switch.dehumidifier')
+            sensor = next(device['id'] for device in inventory if device['entity_id'] == 'sensor.humidity')
+
+            for patch in ({'targets': [plug]}, {'sensor_id': sensor}):
+                with self.subTest(connection=connection['id'], changed_role=next(iter(patch))):
+                    create = self.client.post(path, headers=self.alice, json={**body, **patch})
+                    self.assertEqual(create.status_code, 422, create.text)
+                    self.assertIn(expected_detail, create.json()['detail'])
+                    update = self.client.put(path + '/' + controller['controller_id'], headers=self.alice,
+                                             json={**body, **patch, 'expected_version': controller['version']})
+                    self.assertEqual(update.status_code, 422, update.text)
+
+        saved = self.client.get(path + '/' + controller['controller_id'], headers=self.alice).json()
+        self.assertEqual(saved['bindings'], controller['bindings'])
+        self.assertEqual(saved['version'], controller['version'])
+        self.assertEqual(len(self.client.get(path, headers=self.alice).json()), 1)
 
     def test_controller_capabilities_validate_actual_roles(self):
         controller, body, ac = self.humidity_controller()
