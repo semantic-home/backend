@@ -10,8 +10,8 @@ from .models import AutomationSpec
 
 
 def window_active(spec: AutomationSpec, now: datetime, timezone: str) -> bool:
-    if spec.uses_sun:
-        raise ValueError("Solar schedules are event triggers, not continuously enforced time windows")
+    if spec.uses_sun or spec.kind == "lighting_ramp":
+        raise ValueError("Solar schedules and dawn ramps have their own execution timing")
     local = now.astimezone(ZoneInfo(timezone))
     clock, day = local.strftime("%H:%M"), local.weekday()
     if not spec.start:
@@ -76,6 +76,9 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         "variables": {"semantic_home_bindings": {d["entity_id"]: d["attributes"].get("registry_id")
                                                  for d in targets + sensors}},
     }
+    if spec.kind == "lighting_ramp":
+        from .lighting import compile_ramp
+        return compile_ramp(config, rule_id, spec, targets)
     if spec.kind == "cleaning":
         config["triggers"] = [{"trigger": "time", "at": spec.at + ":00"}]
         config["conditions"] = [{"condition": "template", "value_template": "{{ " + _window(spec) + " }}"}]

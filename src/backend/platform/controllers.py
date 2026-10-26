@@ -45,14 +45,15 @@ def normalized_bindings(controller):
 
 def check_rule_binding(controller, spec):
     bindings = normalized_bindings(controller)
-    if (spec.kind != KINDS[controller["domain"]] or spec.targets != bindings["targets"]
+    allowed = {KINDS[controller["domain"]]} | ({"lighting_ramp"} if controller["domain"] == "lighting" else set())
+    if (spec.kind not in allowed or spec.targets != bindings["targets"]
             or set(spec.sensor_ids) != set(bindings["sensor_ids"])):
         raise HTTPException(422, "Rule entities and purpose must match the controller. Edit the controller to change entity roles.")
 
 
 def create_from_spec(db, home_id, spec, agent_id):
     """Compatibility for old API clients; a saved rule always has a controller."""
-    domain = {"humidity_band": "humidity", "cleaning": "cleaning"}.get(spec.kind, "power")
+    domain = {"humidity_band": "humidity", "cleaning": "cleaning", "lighting_ramp": "lighting"}.get(spec.kind, "power")
     if spec.kind == "time_window" and db.one("SELECT id FROM devices WHERE home_id=%s AND id=ANY(%s) AND split_part(entity_id,'.',1)='light'", (home_id, spec.targets)):
         domain = "lighting"
     ensure_zones(db, home_id)

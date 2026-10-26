@@ -23,6 +23,11 @@ def infer_capabilities(entity_id: str, attributes: Dict[str, Any]) -> Dict[str, 
         if "brightness" in attributes or modes - {"onoff", "unknown"}:
             caps["brightness"] = {"supported": True}
             caps["actions"].append("set_brightness")
+        low, high = attributes.get("min_color_temp_kelvin"), attributes.get("max_color_temp_kelvin")
+        if "color_temp" in modes and isinstance(low, (int, float)) and isinstance(high, (int, float)) and 1000 <= low <= high <= 10000:
+            caps["color_temp"] = {"supported": True, "min_kelvin": int(low), "max_kelvin": int(high)}
+        features = attributes.get("supported_features", 0)
+        caps["transition"] = isinstance(features, int) and bool(features & 32)
         return caps
 
     if domain == "valve":

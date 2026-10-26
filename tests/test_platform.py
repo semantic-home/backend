@@ -243,6 +243,49 @@ class HouseholdIntegrationTest(unittest.TestCase):
             self.assertEqual(own["metadata"]["location"]["name"], "Home location")
             self.assertEqual(self.client.get("/api/v1/connections", headers=self.bob).json(), [])
 
+    def test_dawn_group_rule_persists_on_lighting_controller_and_keeps_home_and_connection_boundaries(self):
+        from psycopg.types.json import Jsonb
+        from backend.platform.models import DawnRamp
+        ac, bc = self.connection(self.alice), self.connection(self.bob)
+        attrs = {"friendly_name": "Dawn lamp", "supported_color_modes": ["color_temp"],
+                 "min_color_temp_kelvin": 2702, "max_color_temp_kelvin": 6666, "supported_features": 44}
+        self.ingest(self.alice, ac, "light.first", attrs=attrs)
+        items = self.ingest(self.alice, ac, "light.second", attrs=attrs)
+        targets = [d["id"] for d in items]
+        foreign = self.ingest(self.bob, bc, "light.first", attrs=attrs)[0]
+        self.app.state.db.execute("UPDATE agents SET metadata=%s WHERE id=%s", (Jsonb({"timezone": "Europe/Berlin", "location": {
+            "name": "Meckenheim", "latitude": 50.625, "longitude": 7.022}}), ac["id"]))
+        zone = self.client.post("/api/v1/zones", headers=self.alice, json={"name": "Living room"}).json()
+        response = self.client.post("/api/v1/domains/lighting/controllers", headers=self.alice, json={
+            "display_name": "Dawn lamps", "zone_id": zone["id"], "targets": targets})
+        self.assertEqual(response.status_code, 200, response.text)
+        controller = response.json()
+        rule = {"name": "Real dawn", "kind": "lighting_ramp", "targets": targets, "ramp": DawnRamp().model_dump()}
+        response = self.client.post("/api/v1/automations", headers=self.alice, json={"spec": rule, "controller_id": controller["controller_id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        saved = response.json()
+        self.assertEqual((saved["status"], saved["spec"]["ramp"]["start_at"]), ("draft", "06:00"))
+        self.assertFalse(saved["requested"])
+        response = self.client.post("/api/v1/automations/preview", headers=self.alice, json=rule)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["ramp"]["location_name"], "Meckenheim")
+        self.assertEqual(len(response.json()["ramp"]["lamps"]), 2)
+        self.assertTrue(all(d["desired"] == "scheduled" for d in response.json()["items"]))
+        self.assertIsNone(response.json()["window_active"])
+        # New rule kinds use exactly the same household and connection isolation.
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.alice, json={**rule, "targets": [targets[0], foreign["id"]]}).status_code, 422)
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.bob, json=rule).status_code, 422)
+        other_connection = self.connection(self.alice)
+        other = self.ingest(self.alice, other_connection, "light.third", attrs=attrs)[0]
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.alice, json={**rule, "targets": [targets[0], other["id"]]}).status_code, 422)
+        plain = self.ingest(self.alice, ac, "light.plain", attrs={"supported_color_modes": ["brightness"]})
+        plain_id = next(d["id"] for d in plain if d["entity_id"] == "light.plain")
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.alice, json={**rule, "targets": [plain_id]}).status_code, 422)
+        brightness = {**rule, "targets": [plain_id], "ramp": {**rule["ramp"], "color_mode": "brightness"}}
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.alice, json=brightness).status_code, 200)
+        power = self.client.post("/api/v1/domains/power/controllers", headers=self.alice, json={"display_name": "Power", "zone_id": zone["id"], "targets": targets}).json()
+        self.assertEqual(self.client.post("/api/v1/automations", headers=self.alice, json={"spec": rule, "controller_id": power["controller_id"]}).status_code, 422)
+
     def test_same_entity_ids_and_all_legacy_routes_are_isolated(self):
         ac, bc = self.connection(self.alice), self.connection(self.bob)
         ad = self.ingest(self.alice, ac, state="on")[0]

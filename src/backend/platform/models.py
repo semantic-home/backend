@@ -56,9 +56,43 @@ class SensorSelection(StrictModel):
         return self
 
 
+class LightLevel(StrictModel):
+    brightness_pct: int = Field(ge=1, le=100)
+    kelvin: int = Field(ge=1000, le=10000)
+
+
+class DawnRamp(StrictModel):
+    start_at: str = "06:00"
+    stop_at: str = "12:00"
+    off_at_end: bool = False
+    startup_minutes: int = Field(default=10, ge=1, le=120)
+    initial_brightness_pct: int = Field(default=1, ge=1, le=100)
+    color_mode: Literal["white", "brightness"] = "white"
+    astronomical: LightLevel = Field(default_factory=lambda: LightLevel(brightness_pct=1, kelvin=2702))
+    nautical: LightLevel = Field(default_factory=lambda: LightLevel(brightness_pct=10, kelvin=3000))
+    civil: LightLevel = Field(default_factory=lambda: LightLevel(brightness_pct=45, kelvin=4000))
+    daylight: LightLevel = Field(default_factory=lambda: LightLevel(brightness_pct=100, kelvin=5500))
+
+    @field_validator("start_at", "stop_at")
+    @classmethod
+    def valid_clock(cls, value):
+        if len(value) != 5 or time.fromisoformat(value).second:
+            raise ValueError("Use HH:MM")
+        return value
+
+    @model_validator(mode="after")
+    def valid_ramp(self):
+        if self.start_at >= self.stop_at:
+            raise ValueError("A dawn ramp must start and stop on the same day, with stop after start")
+        levels = [self.initial_brightness_pct] + [getattr(self, key).brightness_pct for key in ("astronomical", "nautical", "civil", "daylight")]
+        if levels != sorted(levels):
+            raise ValueError("Dawn brightness must stay level or increase from the dim start through daylight")
+        return self
+
+
 class AutomationSpec(SensorSelection):
     name: str = Field(min_length=1, max_length=100)
-    kind: Literal["humidity_band", "time_window", "cleaning"]
+    kind: Literal["humidity_band", "time_window", "cleaning", "lighting_ramp"]
     targets: list[str] = Field(min_length=1)
     lower: float = Field(default=52, ge=0, le=100)
     upper: float = Field(default=55, ge=0, le=100)
@@ -73,6 +107,7 @@ class AutomationSpec(SensorSelection):
     min_cycle_seconds: int = Field(default=180, ge=0, le=86400)
     sensor_stale_seconds: int = Field(default=1800, ge=60, le=86400)
     brightness_pct: int | None = Field(default=None, ge=1, le=100)
+    ramp: DawnRamp | None = None
     enabled: bool = True
 
     @field_validator("targets")
@@ -99,6 +134,11 @@ class AutomationSpec(SensorSelection):
 
     @model_validator(mode="after")
     def valid_rule(self):
+        if self.kind == "lighting_ramp":
+            if self.ramp is None or self.start or self.end or self.uses_sun or self.start_offset_minutes or self.end_offset_minutes or self.brightness_pct is not None:
+                raise ValueError("A dawn ramp uses its own start, stop and light levels")
+        elif self.ramp is not None:
+            raise ValueError("Ramp settings require a lighting ramp rule")
         if self.lower >= self.upper:
             raise ValueError("Lower humidity threshold must be below upper threshold")
         if self.uses_sun:

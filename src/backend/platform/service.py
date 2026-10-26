@@ -10,6 +10,7 @@ from backend.semantic.capabilities import infer_capabilities
 from .compiler import compile_automation
 from .models import AutomationSpec
 from .solar import solar_preview
+from .lighting import ramp_preview
 
 
 class AutomationService:
@@ -42,6 +43,11 @@ class AutomationService:
                 raise HTTPException(422, "This device cannot be switched on and off")
             if spec.brightness_pct is not None and "set_brightness" not in actions:
                 raise HTTPException(422, "Every selected target must support brightness")
+            if spec.kind == "lighting_ramp":
+                if not d["entity_id"].startswith("light.") or "set_brightness" not in actions:
+                    raise HTTPException(422, "A dawn ramp needs dimmable lights on every target")
+                if spec.ramp.color_mode == "white" and not caps.get("color_temp"):
+                    raise HTTPException(422, "Warm-to-cool white needs colour temperature support on every lamp. Choose brightness only for this group.")
         return targets, sensors, next(iter(agents))
 
     async def deploy(self, home_id, rule_id):
@@ -131,8 +137,12 @@ class AutomationService:
                 break
         if sensors and len(readings) == len(sensors):
             value = max(readings)
-        active = None if spec.uses_sun else window_active(spec, now, home["timezone"])
+        active = None if spec.uses_sun or spec.kind == "lighting_ramp" else window_active(spec, now, home["timezone"])
         schedule = None
+        ramp = None
+        if spec.kind == "lighting_ramp":
+            agent = self.db.agent(home["id"], agent_id)
+            ramp = ramp_preview(spec, agent["metadata"], agent["name"], home["timezone"], now, self.hub.is_connected(agent_id), targets)
         if spec.uses_sun:
             agent = self.db.agent(home["id"], agent_id)
             schedule = solar_preview(spec, agent["metadata"], agent["name"], home["timezone"], now, self.hub.is_connected(agent_id))
@@ -141,8 +151,8 @@ class AutomationService:
             desired, reason = (humidity_decision(spec, value, target["state"] == "on", active)
                                if spec.kind == "humidity_band" else (active, "time_window"))
             items.append({"id": target["id"], "name": target["attributes"].get("friendly_name", target["entity_id"]),
-                          "current": target["state"], "desired": ("scheduled" if spec.kind == "cleaning" or spec.uses_sun else ("on" if desired else "off")),
-                          "reason": "solar_schedule" if spec.uses_sun else reason})
+                          "current": target["state"], "desired": ("scheduled" if spec.kind in {"cleaning", "lighting_ramp"} or spec.uses_sun else ("on" if desired else "off")),
+                          "reason": "lighting_ramp" if spec.kind == "lighting_ramp" else "solar_schedule" if spec.uses_sun else reason})
         return {"items": items, "humidity": value, "sensor_count": len(sensors), "humidity_aggregation": "maximum", "window_active": active, "timezone": home["timezone"],
-                "agent_id": agent_id, "schedule": schedule,
+                "agent_id": agent_id, "schedule": schedule, "ramp": ramp,
                 "note": "Preview sends no commands. Local availability and minimum switching intervals also apply."}
