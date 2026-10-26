@@ -62,6 +62,8 @@ class LightLevel(StrictModel):
 
 
 class DawnRamp(StrictModel):
+    # Missing direction preserves existing dawn rules.
+    direction: Literal["dawn", "dusk"] = "dawn"
     start_at: str = "06:00"
     stop_at: str = "12:00"
     off_at_end: bool = False
@@ -83,10 +85,14 @@ class DawnRamp(StrictModel):
     @model_validator(mode="after")
     def valid_ramp(self):
         if self.start_at >= self.stop_at:
-            raise ValueError("A dawn ramp must start and stop on the same day, with stop after start")
-        levels = [self.initial_brightness_pct] + [getattr(self, key).brightness_pct for key in ("astronomical", "nautical", "civil", "daylight")]
-        if levels != sorted(levels):
-            raise ValueError("Dawn brightness must stay level or increase from the dim start through daylight")
+            raise ValueError("A lighting ramp must start and stop on the same day, with stop after start")
+        keys = ("astronomical", "nautical", "civil", "daylight")
+        if self.direction == "dusk":
+            keys = tuple(reversed(keys))
+        levels = [self.initial_brightness_pct] + [getattr(self, key).brightness_pct for key in keys]
+        if levels != sorted(levels, reverse=self.direction == "dusk"):
+            raise ValueError("Dusk brightness must stay level or decrease from the starting level through astronomical twilight" if self.direction == "dusk"
+                             else "Dawn brightness must stay level or increase from the dim start through daylight")
         return self
 
 
@@ -136,7 +142,7 @@ class AutomationSpec(SensorSelection):
     def valid_rule(self):
         if self.kind == "lighting_ramp":
             if self.ramp is None or self.start or self.end or self.uses_sun or self.start_offset_minutes or self.end_offset_minutes or self.brightness_pct is not None:
-                raise ValueError("A dawn ramp uses its own start, stop and light levels")
+                raise ValueError("A lighting ramp uses its own start, stop and light levels")
         elif self.ramp is not None:
             raise ValueError("Ramp settings require a lighting ramp rule")
         if self.lower >= self.upper:

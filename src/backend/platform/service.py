@@ -45,9 +45,9 @@ class AutomationService:
                 raise HTTPException(422, "Every selected target must support brightness")
             if spec.kind == "lighting_ramp":
                 if not d["entity_id"].startswith("light.") or "set_brightness" not in actions:
-                    raise HTTPException(422, "A dawn ramp needs dimmable lights on every target")
+                    raise HTTPException(422, "A lighting ramp needs dimmable lights on every target")
                 if spec.ramp.color_mode == "white" and not caps.get("color_temp"):
-                    raise HTTPException(422, "Warm-to-cool white needs colour temperature support on every lamp. Choose brightness only for this group.")
+                    raise HTTPException(422, "White temperature needs colour temperature support on every lamp. Choose brightness only for this group.")
         return targets, sensors, next(iter(agents))
 
     async def deploy(self, home_id, rule_id):
@@ -105,6 +105,16 @@ class AutomationService:
         for row in rows:
             for other in [row["deployed_spec"], row["spec"] if row["requested"] else None]:
                 if other and other["enabled"] and set(spec.targets).intersection(other["targets"]):
+                    # Ramps only act inside their fixed same-day windows. Keep
+                    # other ownership checks conservative. Treat a shared
+                    # boundary as overlapping: a stop-off and start-on at the
+                    # same instant could race in Home Assistant.
+                    if spec.kind == other.get("kind") == "lighting_ramp":
+                        previous = AutomationSpec.model_validate(other)
+                        if (not set(spec.weekdays).intersection(previous.weekdays)
+                                or spec.ramp.stop_at < previous.ramp.start_at
+                                or previous.ramp.stop_at < spec.ramp.start_at):
+                            continue
                     raise HTTPException(409, f"Pause the overlapping automation first: {other['name']}")
         # Preserve ownership of actuators already assigned to the watering runtime.
         target_ids = {d["entity_id"] for d in self.db.all("SELECT entity_id FROM devices WHERE home_id=%s AND id=ANY(%s)", (home_id, spec.targets))}

@@ -11,7 +11,7 @@ from .models import AutomationSpec
 
 def window_active(spec: AutomationSpec, now: datetime, timezone: str) -> bool:
     if spec.uses_sun or spec.kind == "lighting_ramp":
-        raise ValueError("Solar schedules and dawn ramps have their own execution timing")
+        raise ValueError("Solar schedules and lighting ramps have their own execution timing")
     local = now.astimezone(ZoneInfo(timezone))
     clock, day = local.strftime("%H:%M"), local.weekday()
     if not spec.start:

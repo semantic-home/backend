@@ -273,6 +273,17 @@ class HouseholdIntegrationTest(unittest.TestCase):
         self.assertEqual(len(response.json()["ramp"]["lamps"]), 2)
         self.assertTrue(all(d["desired"] == "scheduled" for d in response.json()["items"]))
         self.assertIsNone(response.json()["window_active"])
+        # An evening companion persists independently on the same controller.
+        dusk = {**rule, "name": "Real dusk", "ramp": {**rule["ramp"], "direction": "dusk", "start_at": "16:00",
+                "stop_at": "23:00", "initial_brightness_pct": 100, "off_at_end": True}}
+        response = self.client.post("/api/v1/automations", headers=self.alice, json={"spec": dusk, "controller_id": controller["controller_id"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["spec"]["ramp"]["direction"], "dusk")
+        rules = self.client.get("/api/v1/automations?controller_id=" + controller["controller_id"], headers=self.alice).json()
+        self.assertEqual({r["spec"]["ramp"]["direction"] for r in rules}, {"dawn", "dusk"})
+        preview = self.client.post("/api/v1/automations/preview", headers=self.alice, json=dusk)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual([p["key"] for p in preview.json()["ramp"]["phases"]], ["daylight", "civil", "nautical", "astronomical"])
         # New rule kinds use exactly the same household and connection isolation.
         self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.alice, json={**rule, "targets": [targets[0], foreign["id"]]}).status_code, 422)
         self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.bob, json=rule).status_code, 422)
