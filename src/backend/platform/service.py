@@ -22,13 +22,13 @@ class AutomationService:
         targets = [by_id.get(target) for target in spec.targets]
         if any(d is None for d in targets):
             raise HTTPException(422, "A selected device does not belong to this household")
-        sensor = self.db.device(home_id, spec.sensor_id) if spec.sensor_id else None
-        if spec.sensor_id and not sensor:
-            raise HTTPException(422, "Selected sensor does not belong to this household")
-        if spec.kind == "humidity_band" and (not sensor or sensor["attributes"].get("device_class") != "humidity"
-                                             or sensor["attributes"].get("unit_of_measurement") != "%"):
-            raise HTTPException(422, "Select a room humidity sensor measured in %")
-        agents = {d["agent_id"] for d in targets + ([sensor] if sensor else [])}
+        sensors = [self.db.device(home_id, sensor_id) for sensor_id in spec.sensor_ids]
+        if any(sensor is None for sensor in sensors):
+            raise HTTPException(422, "A selected sensor does not belong to this household")
+        if spec.kind == "humidity_band" and (not sensors or any(sensor["attributes"].get("device_class") != "humidity"
+                                             or sensor["attributes"].get("unit_of_measurement") != "%" for sensor in sensors)):
+            raise HTTPException(422, "Select room humidity sensors measured in %")
+        agents = {d["agent_id"] for d in targets + sensors}
         if len(agents) != 1:
             raise HTTPException(422, "One local rule must use devices from the same Home Assistant connection")
         for d in targets:
@@ -41,7 +41,7 @@ class AutomationService:
                 raise HTTPException(422, "This device cannot be switched on and off")
             if spec.brightness_pct is not None and "set_brightness" not in actions:
                 raise HTTPException(422, "Every selected target must support brightness")
-        return targets, sensor, next(iter(agents))
+        return targets, sensors, next(iter(agents))
 
     async def deploy(self, home_id, rule_id):
         async with self._locks.setdefault(rule_id, asyncio.Lock()):
@@ -58,7 +58,7 @@ class AutomationService:
                 if rule["deleted"]:
                     args = {"config_id": "semantic_home_" + rule_id.replace("-", ""), "delete": True}
                 else:
-                    targets, sensor, agent_id = self.bindings(home_id, spec)
+                    targets, sensors, agent_id = self.bindings(home_id, spec)
                     if agent_id != rule["agent_id"]:
                         raise ValueError("The automation connection has changed")
                     agent = self.db.agent(home_id, agent_id)
@@ -67,10 +67,10 @@ class AutomationService:
                     home = self.db.one("SELECT timezone FROM homes WHERE id=%s", (home_id,))
                     if spec.enabled and agent["metadata"].get("timezone") != home["timezone"]:
                         raise ValueError("Home Assistant and household timezones must match before deployment")
-                    if spec.enabled and any(not d["available"] or d["state"] in {"unknown", "unavailable"} for d in targets + ([sensor] if sensor else [])):
+                    if spec.enabled and any(not d["available"] or d["state"] in {"unknown", "unavailable"} for d in targets + sensors):
                         raise ValueError("Selected devices are unavailable; reconnect and retry")
                     self.check_conflicts(home_id, rule_id, spec)
-                    config = compile_automation(rule_id, spec, targets, sensor, rule["version"])
+                    config = compile_automation(rule_id, spec, targets, sensors, rule["version"])
                     args = {"config_id": config["id"], "config": config, "timezone": home["timezone"]}
                 self.db.execute("UPDATE automations SET status='pending',error=NULL WHERE home_id=%s AND id=%s AND version=%s",
                                 (home_id, rule_id, rule["version"]))
@@ -112,18 +112,24 @@ class AutomationService:
 
     def preview(self, home, spec):
         from .compiler import humidity_decision, window_active
-        targets, sensor, agent_id = self.bindings(home["id"], spec)
+        targets, sensors, agent_id = self.bindings(home["id"], spec)
         now = datetime.now(timezone.utc)
         value = None
-        if sensor and sensor["available"]:
+        readings = []
+        for sensor in sensors:
             try:
+                if not sensor["available"]:
+                    break
                 raw_at = sensor["attributes"].get("_ha_last_updated")
                 updated_at = datetime.fromisoformat(raw_at) if raw_at else sensor["seen_at"]
                 candidate = float(sensor["state"])
-                if 0 <= candidate <= 100 and (now - updated_at).total_seconds() <= spec.sensor_stale_seconds:
-                    value = candidate
+                if not (0 <= candidate <= 100 and 0 <= (now - updated_at).total_seconds() < spec.sensor_stale_seconds):
+                    break
+                readings.append(candidate)
             except (ValueError, TypeError):
-                pass
+                break
+        if sensors and len(readings) == len(sensors):
+            value = max(readings)
         active = window_active(spec, now, home["timezone"])
         items = []
         for target in targets:
@@ -132,5 +138,5 @@ class AutomationService:
             items.append({"id": target["id"], "name": target["attributes"].get("friendly_name", target["entity_id"]),
                           "current": target["state"], "desired": ("scheduled" if spec.kind == "cleaning" else ("on" if desired else "off")),
                           "reason": reason})
-        return {"items": items, "humidity": value, "window_active": active, "timezone": home["timezone"],
+        return {"items": items, "humidity": value, "sensor_count": len(sensors), "humidity_aggregation": "maximum", "window_active": active, "timezone": home["timezone"],
                 "agent_id": agent_id, "note": "Preview sends no commands. Local availability and minimum switching intervals also apply."}

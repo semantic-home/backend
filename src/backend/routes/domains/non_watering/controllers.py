@@ -3,7 +3,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from psycopg.types.json import Jsonb
 
-from backend.platform.controllers import KINDS, controller_spec, ensure_zones, get_controller, view
+from backend.platform.controllers import KINDS, binding_fields, controller_spec, ensure_zones, get_controller, normalized_bindings, view
 from backend.platform.database import uid
 from backend.platform.models import AutomationSpec, ControllerSave
 
@@ -41,7 +41,7 @@ async def save_controller(domain: str, body: ControllerSave, request: Request, c
         ensure_zones(db, home_id)
         if not db.one('SELECT id FROM semantic_zones WHERE home_id=%s AND id=%s', (home_id, body.zone_id)):
             raise HTTPException(422, 'Choose a zone from this household')
-        proposed = {'display_name': body.display_name, 'domain': domain, 'bindings': {'targets': body.targets, 'sensor_id': body.sensor_id}}
+        proposed = {'display_name': body.display_name, 'domain': domain, 'bindings': binding_fields(body)}
         try:
             spec = controller_spec(proposed)
         except ValueError as exc:
@@ -51,7 +51,7 @@ async def save_controller(domain: str, body: ControllerSave, request: Request, c
             current = get_controller(db, home_id, controller_id)
             if current['domain'] != domain:
                 raise HTTPException(409, 'The controller purpose cannot be changed')
-            changed = current['bindings'] != proposed['bindings'] or agent_id != current['agent_id']
+            changed = normalized_bindings(current) != proposed['bindings'] or agent_id != current['agent_id']
             with db.pool.connection() as conn:
                 rules = conn.execute("SELECT * FROM automations WHERE home_id=%s AND controller_id=%s AND status<>'deleted' FOR UPDATE", (home_id, controller_id)).fetchall()
                 if agent_id != current['agent_id'] and any(r['deployed_version'] is not None for r in rules):

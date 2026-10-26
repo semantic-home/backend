@@ -50,7 +50,9 @@ def _window(spec):
             f"((now().weekday() - 1) % 7 in {days} and {clock} < {end}))")
 
 
-def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], sensor: dict | None, version: int):
+def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], sensors: list[dict] | dict | None, version: int):
+    # Legacy callers may still supply one sensor record.
+    sensors = [sensors] if isinstance(sensors, dict) else sensors or []
     owned_id = "semantic_home_" + rule_id.replace("-", "")
     if not re.fullmatch(r"semantic_home_[a-f0-9]{32}", owned_id):
         raise ValueError("Invalid automation ID")
@@ -60,7 +62,7 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         "initial_state": spec.enabled, "mode": "single", "max_exceeded": "silent",
         "triggers": [], "conditions": [], "actions": [],
         "variables": {"semantic_home_bindings": {d["entity_id"]: d["attributes"].get("registry_id")
-                                                 for d in targets + ([sensor] if sensor else [])}},
+                                                 for d in targets + sensors}},
     }
     if spec.kind == "cleaning":
         config["triggers"] = [{"trigger": "time", "at": spec.at + ":00"}]
@@ -81,20 +83,27 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         {"trigger": "event", "event_type": "automation_reloaded"},
         {"trigger": "time_pattern", "minutes": "/1"},
     ]
-    if sensor:
-        config["triggers"].append({"trigger": "state", "entity_id": sensor["entity_id"]})
+    if sensors:
+        config["triggers"].append({"trigger": "state", "entity_id": [sensor["entity_id"] for sensor in sensors]})
     active = _window(spec)
+    if sensors:
+        valid_readings, values = [], []
+        for sensor in sensors:
+            sid = _entity(sensor["entity_id"])
+            valid = (f"(is_number(states({sid})) and 0 <= states({sid}) | float(0) <= 100 and "
+                     f"0 <= as_timestamp(now()) - as_timestamp(states[{sid}].last_updated) < {spec.sensor_stale_seconds})")
+            if sensor["attributes"].get("device_id"):
+                valid = f"({valid} and device_id({sid}) == {json.dumps(sensor['attributes']['device_id'])})"
+            valid_readings.append(valid)
+            values.append(f"states({sid}) | float(0)")
+        valid = "(" + " and ".join(valid_readings) + ")"
+        measurement = "([" + ", ".join(values) + "] | max)"
     for device in targets:
         eid = device["entity_id"]
         quoted, domain = _entity(eid), eid.split(".")[0]
-        if sensor:
-            sid = _entity(sensor["entity_id"])
-            valid = (f"(is_number(states({sid})) and 0 <= states({sid}) | float(0) <= 100 and "
-                     f"as_timestamp(now()) - as_timestamp(states[{sid}].last_updated) < {spec.sensor_stale_seconds})")
-            if sensor["attributes"].get("device_id"):
-                valid = f"({valid} and device_id({sid}) == {json.dumps(sensor['attributes']['device_id'])})"
-            off = f"(not ({active}) or not {valid} or states({sid}) | float(0) <= {spec.lower})"
-            on = f"(({active}) and {valid} and states({sid}) | float(0) >= {spec.upper})"
+        if sensors:
+            off = f"(not ({active}) or not {valid} or {measurement} <= {spec.lower})"
+            on = f"(({active}) and {valid} and {measurement} >= {spec.upper})"
             elapsed = f"(as_timestamp(now()) - as_timestamp(states[{quoted}].last_changed) >= {spec.min_cycle_seconds})"
             off = f"({off} and ({elapsed} or not {valid} or not ({active})))"
             on = f"({on} and {elapsed})"
@@ -118,7 +127,7 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         ]})
         for index, branch in enumerate(config["actions"][-1]["choose"]):
             reason = ("{{ 'sensor_unavailable' if not (" + valid + ") else 'outside_window' if not (" + active + ") else 'lower_threshold' }}"
-                      if sensor and index == 0 else "upper_threshold" if sensor else "time_window")
+                      if sensors and index == 0 else "upper_threshold" if sensors else "time_window")
             branch["sequence"].append({"event": "semantic_home_action", "event_data": {
                 "automation_id": rule_id, "entity_id": eid, "desired": "off" if index == 0 else "on", "reason": reason}})
         if device["attributes"].get("device_id"):

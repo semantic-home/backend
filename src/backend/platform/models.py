@@ -39,11 +39,27 @@ class Credentials(StrictModel):
         return value
 
 
-class AutomationSpec(StrictModel):
+class SensorSelection(StrictModel):
+    # Keep the legacy field readable while new clients select multiple sensors.
+    sensor_id: str | None = None
+    sensor_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize_sensors(self):
+        if self.sensor_id and self.sensor_ids and self.sensor_ids != [self.sensor_id]:
+            raise ValueError("Use sensor_ids for multiple sensors; conflicting sensor selections are not allowed")
+        if self.sensor_id and not self.sensor_ids:
+            self.sensor_ids = [self.sensor_id]
+        if any(not value.strip() for value in self.sensor_ids) or len(set(self.sensor_ids)) != len(self.sensor_ids):
+            raise ValueError("Select each humidity sensor only once")
+        self.sensor_id = self.sensor_ids[0] if len(self.sensor_ids) == 1 else None
+        return self
+
+
+class AutomationSpec(SensorSelection):
     name: str = Field(min_length=1, max_length=100)
     kind: Literal["humidity_band", "time_window", "cleaning"]
     targets: list[str] = Field(min_length=1)
-    sensor_id: str | None = None
     lower: float = Field(default=52, ge=0, le=100)
     upper: float = Field(default=55, ge=0, le=100)
     weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
@@ -83,10 +99,10 @@ class AutomationSpec(StrictModel):
             raise ValueError("Lower humidity threshold must be below upper threshold")
         if bool(self.start) != bool(self.end) or (self.start and self.start == self.end):
             raise ValueError("Select distinct start and end times")
-        if self.kind == "humidity_band" and not self.sensor_id:
-            raise ValueError("Select a room humidity sensor")
-        if self.kind != "humidity_band" and self.sensor_id:
-            raise ValueError("Only humidity rules use a humidity sensor")
+        if self.kind == "humidity_band" and not self.sensor_ids:
+            raise ValueError("Select at least one room humidity sensor")
+        if self.kind != "humidity_band" and self.sensor_ids:
+            raise ValueError("Only humidity rules use humidity sensors")
         if self.kind == "time_window" and not self.start:
             raise ValueError("Select a time window")
         if self.kind == "cleaning" and self.start:
@@ -111,11 +127,10 @@ class ZoneCreate(StrictModel):
         return value.strip()
 
 
-class ControllerSave(StrictModel):
+class ControllerSave(SensorSelection):
     display_name: str = Field(min_length=1, max_length=100)
     zone_id: str = Field(min_length=1)
     targets: list[str] = Field(min_length=1)
-    sensor_id: str | None = None
     expected_version: int | None = Field(default=None, ge=1)
 
     @field_validator("display_name")

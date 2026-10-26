@@ -90,6 +90,52 @@ class RuleModelTest(unittest.TestCase):
             actual = [env.from_string(b["conditions"][1]["value_template"]).render(**context) for b in config["actions"][0]["choose"]]
             self.assertEqual(actual, [off, on], (value, stale, elapsed))
 
+    def test_sensor_selection_preserves_legacy_inputs_and_rejects_ambiguity(self):
+        self.assertEqual(self.rule().sensor_ids, ['humidity'])
+        multiple = AutomationSpec(name='Rooms', kind='humidity_band', targets=['plug'], sensor_ids=['kitchen', 'living'])
+        self.assertEqual(multiple.sensor_ids, ['kitchen', 'living'])
+        self.assertIsNone(multiple.sensor_id)
+        self.assertEqual(AutomationSpec.model_validate(multiple.model_dump()).sensor_ids, multiple.sensor_ids)
+        for patch in [{'sensor_ids': []}, {'sensor_ids': ['same', 'same']}, {'sensor_ids': ['']},
+                      {'sensor_id': 'kitchen', 'sensor_ids': ['living']}, {'sensor_ids': ['kitchen'], 'kind': 'time_window', 'start': '08:00', 'end': '22:00'}]:
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                AutomationSpec.model_validate({'name': 'Rooms', 'kind': 'humidity_band', 'targets': ['plug'], **patch})
+
+    def test_multiple_sensors_use_highest_reading_and_all_must_be_valid(self):
+        from jinja2.nativetypes import NativeEnvironment
+        from datetime import timedelta
+        import math
+        rule = AutomationSpec(name='Rooms', kind='humidity_band', targets=['plug'], sensor_ids=['kitchen', 'living'])
+        sensors = [{'entity_id': 'sensor.' + room, 'attributes': {'registry_id': room, 'device_id': room}} for room in ['kitchen', 'living']]
+        config = compile_automation('01234567-0123-4123-8123-0123456789ab', rule,
+                                  [{'entity_id': 'switch.plug', 'attributes': {}}], sensors, 1)
+        self.assertEqual(config['triggers'][-1]['entity_id'], ['sensor.kitchen', 'sensor.living'])
+        self.assertEqual(set(config['variables']['semantic_home_bindings']), {'switch.plug', 'sensor.kitchen', 'sensor.living'})
+        now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+        env = NativeEnvironment()
+        def numeric(value):
+            try: return math.isfinite(float(value))
+            except ValueError: return False
+        for kitchen, living, age, elapsed, identity, expected in [
+            ('56', '51', 0, 200, True, [False, True]), ('51', '56', 0, 200, True, [False, True]),
+            ('52', '51', 0, 200, True, [True, False]), ('51', '53', 0, 200, True, [False, False]),
+            ('53.4', '51.5', 0, 200, True, [False, False]), ('55', '50', 0, 1, True, [False, False]),
+            ('55', 'unknown', 0, 1, True, [True, False]), ('55', 'unavailable', 0, 1, True, [True, False]),
+            ('55', 'nan', 0, 1, True, [True, False]), ('55', '101', 0, 1, True, [True, False]),
+            ('55', '51', 1800, 1, True, [True, False]), ('55', '51', 0, 1, False, [True, False]),
+        ]:
+            class States:
+                def __init__(self):
+                    self.values = {'sensor.kitchen': SimpleNamespace(state=kitchen, last_updated=now),
+                                   'sensor.living': SimpleNamespace(state=living, last_updated=now-timedelta(seconds=age)),
+                                   'switch.plug': SimpleNamespace(last_changed=now-timedelta(seconds=elapsed))}
+                def __call__(self, eid): return self.values[eid].state
+                def __getitem__(self, eid): return self.values[eid]
+            context = {'states': States(), 'now': lambda: now, 'as_timestamp': lambda value: value.timestamp(),
+                       'is_number': numeric, 'device_id': lambda eid: eid.split('.')[1] if identity else 'replacement'}
+            actual = [env.from_string(branch['conditions'][1]['value_template']).render(**context) for branch in config['actions'][0]['choose']]
+            self.assertEqual(actual, expected, (kitchen, living, age, elapsed, identity))
+
 
 class HubTest(unittest.IsolatedAsyncioTestCase):
     async def test_wrong_agent_and_replaced_connection_cannot_ack(self):
@@ -403,6 +449,64 @@ class HouseholdIntegrationTest(unittest.TestCase):
         self.assertEqual(self.client.get('/api/v1/domains/humidity/zones/cellar/controllers', headers=self.alice).json(), [])
         # Rule inputs cannot independently redefine what the controller means.
         self.assertEqual(self.save_controller_rule(controller, kind='time_window', sensor_id=None, start='08:00', end='22:00').status_code, 422)
+
+    def test_multiple_humidity_sensors_persist_on_controller_and_rule_and_preview_maximum(self):
+        controller, body, ac = self.humidity_controller()
+        items = self.ingest(self.alice, ac, 'sensor.second_room', '51.5',
+                            {'device_class': 'humidity', 'unit_of_measurement': '%', 'registry_id': 'second-room'})
+        second = next(d['id'] for d in items if d['entity_id'] == 'sensor.second_room')
+        sensors = [body['sensor_id'], second]
+        path = '/api/v1/domains/humidity/controllers/' + controller['controller_id']
+        response = self.client.put(path, headers=self.alice, json={**body, 'sensor_id': None, 'sensor_ids': sensors, 'expected_version': 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        updated = response.json()
+        self.assertEqual(updated['bindings']['sensor_ids'], sensors)
+        self.assertIsNone(updated['bindings']['sensor_id'])
+        self.assertEqual(len([e for e in updated['entities'] if e['role'] == 'humidity_sensor']), 2)
+        self.assertEqual(self.client.get(path, headers=self.alice).json()['bindings']['sensor_ids'], sensors)
+        rule = self.save_controller_rule(updated)
+        self.assertEqual(rule.status_code, 200, rule.text)
+        self.assertEqual(rule.json()['spec']['sensor_ids'], sensors)
+        preview = self.client.post('/api/v1/automations/preview', headers=self.alice, json=rule.json()['spec'])
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual((preview.json()['humidity'], preview.json()['sensor_count'], preview.json()['items'][0]['desired']), (56, 2, 'on'))
+        # Missing, stale, invalid or unavailable readings cannot silently disappear
+        # from the aggregate. Any one invalid sensor makes the output fail off.
+        for state, attrs, available in [('unavailable', {}, True), ('nan', {}, True), ('51', {'_ha_last_updated': '2020-01-01T00:00:00+00:00'}, True), ('51', {}, False)]:
+            self.ingest(self.alice, ac, 'sensor.second_room', state, {'device_class': 'humidity', 'unit_of_measurement': '%', **attrs})
+            self.app.state.db.execute('UPDATE devices SET available=%s WHERE id=%s', (available, second))
+            preview = self.client.post('/api/v1/automations/preview', headers=self.alice, json=rule.json()['spec']).json()
+            self.assertIsNone(preview['humidity'])
+            self.assertEqual(preview['items'][0]['desired'], 'off')
+        # A rule cannot quietly omit one of the controller's selected sensors.
+        self.assertEqual(self.save_controller_rule(updated, sensor_ids=[sensors[0]], sensor_id=sensors[0]).status_code, 422)
+
+    def test_additional_humidity_sensor_cannot_cross_home_or_connection(self):
+        controller, body, _ = self.humidity_controller()
+        path = '/api/v1/domains/humidity/controllers/' + controller['controller_id']
+        for headers, expected in [(self.alice, 'same Home Assistant connection'), (self.bob, 'does not belong to this household')]:
+            other = self.connection(headers)
+            items = self.ingest(headers, other, 'sensor.other', '55', {'device_class': 'humidity', 'unit_of_measurement': '%'})
+            sensor = next(d['id'] for d in items if d['entity_id'] == 'sensor.other')
+            response = self.client.put(path, headers=self.alice, json={**body, 'sensor_id': None, 'sensor_ids': [body['sensor_id'], sensor], 'expected_version': 1})
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn(expected, response.json()['detail'])
+        self.assertEqual(self.client.get(path, headers=self.alice).json()['bindings']['sensor_ids'], [body['sensor_id']])
+
+    def test_legacy_single_sensor_controller_normalizes_without_changing_rule_intent(self):
+        from psycopg.types.json import Jsonb
+        controller, body, _ = self.humidity_controller()
+        rule = self.save_controller_rule(controller).json()
+        # Simulate the exact stored bindings used before multi-sensor support.
+        self.app.state.db.execute('UPDATE semantic_controllers SET bindings=%s WHERE id=%s',
+                                  (Jsonb({'targets': body['targets'], 'sensor_id': body['sensor_id']}), controller['controller_id']))
+        path = '/api/v1/domains/humidity/controllers/' + controller['controller_id']
+        response = self.client.put(path, headers=self.alice, json={**body, 'display_name': 'Renamed', 'expected_version': 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['bindings']['sensor_ids'], [body['sensor_id']])
+        saved = self.app.state.db.rule(self.ah, rule['id'])
+        self.assertEqual(saved['version'], rule['version'])
+        self.assertEqual(saved['spec'], rule['spec'])
 
     def test_controller_zone_and_entity_access_are_household_scoped(self):
         controller, body, _ = self.humidity_controller()
