@@ -109,7 +109,8 @@ class RuleModelTest(unittest.TestCase):
         sensors = [{'entity_id': 'sensor.' + room, 'attributes': {'registry_id': room, 'device_id': room}} for room in ['kitchen', 'living']]
         config = compile_automation('01234567-0123-4123-8123-0123456789ab', rule,
                                   [{'entity_id': 'switch.plug', 'attributes': {}}], sensors, 1)
-        self.assertEqual(config['triggers'][-1]['entity_id'], ['sensor.kitchen', 'sensor.living'])
+        measurement_trigger = next(t for t in config['triggers'] if t['trigger'] == 'state' and 'to' not in t)
+        self.assertEqual(measurement_trigger['entity_id'], ['sensor.kitchen', 'sensor.living'])
         self.assertEqual(set(config['variables']['semantic_home_bindings']), {'switch.plug', 'sensor.kitchen', 'sensor.living'})
         now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
         env = NativeEnvironment()

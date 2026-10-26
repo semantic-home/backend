@@ -24,10 +24,10 @@ def window_active(spec: AutomationSpec, now: datetime, timezone: str) -> bool:
 
 
 def humidity_decision(spec: AutomationSpec, value: float | None, is_on: bool, active: bool):
-    if value is None:
-        return False, "sensor_unavailable"
     if not active:
         return False, "outside_window"
+    if value is None:
+        return False, "sensor_unavailable"
     if value >= spec.upper:
         return True, "upper_threshold"
     if value <= spec.lower:
@@ -103,6 +103,17 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         config["mode"] = "queued"
     if sensors:
         config["triggers"].append({"trigger": "state", "entity_id": [sensor["entity_id"] for sensor in sensors]})
+        # A scheduled stop must not wait for a new humidity report or the next
+        # polling tick. Also enforce the schedule if an output is turned on
+        # manually while outside the allowed hours.
+        config["triggers"].append({"trigger": "state", "entity_id": [d["entity_id"] for d in targets], "to": "on", "id": "humidity_output_on"})
+        if spec.start:
+            config["triggers"].extend([
+                {"trigger": "time", "at": spec.start + ":00", "id": "humidity_window_start"},
+                {"trigger": "time", "at": spec.end + ":00", "id": "humidity_window_end"},
+            ])
+        # Keep an end-time event arriving during another device command.
+        config["mode"] = "queued"
     active = _window(spec) if not spec.uses_sun else "false"
     if sensors:
         valid_readings, values = [], []
@@ -151,7 +162,7 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
              "sequence": [on_action]},
         ]})
         for index, branch in enumerate(config["actions"][-1]["choose"]):
-            reason = ("{{ 'sensor_unavailable' if not (" + valid + ") else 'outside_window' if not (" + active + ") else 'lower_threshold' }}"
+            reason = ("{{ 'outside_window' if not (" + active + ") else 'sensor_unavailable' if not (" + valid + ") else 'lower_threshold' }}"
                       if sensors and index == 0 else "upper_threshold" if sensors else "solar_schedule" if spec.uses_sun else "time_window")
             branch["sequence"].append({"event": "semantic_home_action", "event_data": {
                 "automation_id": rule_id, "entity_id": eid, "desired": "off" if index == 0 else "on", "reason": reason}})
