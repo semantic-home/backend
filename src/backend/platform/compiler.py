@@ -10,6 +10,8 @@ from .models import AutomationSpec
 
 
 def window_active(spec: AutomationSpec, now: datetime, timezone: str) -> bool:
+    if spec.uses_sun:
+        raise ValueError("Solar schedules are event triggers, not continuously enforced time windows")
     local = now.astimezone(ZoneInfo(timezone))
     clock, day = local.strftime("%H:%M"), local.weekday()
     if not spec.start:
@@ -50,6 +52,16 @@ def _window(spec):
             f"((now().weekday() - 1) % 7 in {days} and {clock} < {end}))")
 
 
+def _schedule_triggers(spec):
+    triggers = []
+    for edge, action in (("start", "on"), ("end", "off")):
+        event = getattr(spec, edge + "_event")
+        trigger = {"trigger": "time", "at": getattr(spec, edge) + ":00"} if event == "time" else {
+            "trigger": "sun", "event": event, "offset": getattr(spec, edge + "_offset_minutes") * 60}
+        triggers.append({**trigger, "id": "schedule_" + action})
+    return triggers
+
+
 def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], sensors: list[dict] | dict | None, version: int):
     # Legacy callers may still supply one sensor record.
     sensors = [sensors] if isinstance(sensors, dict) else sensors or []
@@ -78,14 +90,17 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
             if d["attributes"].get("device_id"):
                 config["conditions"].append({"condition": "template", "value_template": "{{ device_id(" + _entity(d["entity_id"]) + ") == " + json.dumps(d["attributes"]["device_id"]) + " }}"})
         return config
-    config["triggers"] = [
+    config["triggers"] = _schedule_triggers(spec) if spec.uses_sun else [
         {"trigger": "homeassistant", "event": "start"},
         {"trigger": "event", "event_type": "automation_reloaded"},
         {"trigger": "time_pattern", "minutes": "/1"},
     ]
+    if spec.uses_sun:
+        # A slow target must not discard a following off event.
+        config["mode"] = "queued"
     if sensors:
         config["triggers"].append({"trigger": "state", "entity_id": [sensor["entity_id"] for sensor in sensors]})
-    active = _window(spec)
+    active = _window(spec) if not spec.uses_sun else "false"
     if sensors:
         valid_readings, values = [], []
         for sensor in sensors:
@@ -109,6 +124,13 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
             on = f"({on} and {elapsed})"
         else:
             off, on = f"not ({active})", active
+        if spec.uses_sun:
+            # Weekdays refer to the unshifted sun event's local date. A late
+            # sunset + offset can run after midnight without changing its day.
+            day = ("as_local(as_datetime(as_timestamp(now()) - "
+                   + str(spec.start_offset_minutes * 60) + ")).weekday()")
+            on = f"trigger.id == 'schedule_on' and {day} in {json.dumps(spec.weekdays)}"
+            off = "trigger.id == 'schedule_off'"
         on_state = {"condition": "state", "entity_id": eid, "state": "off"}
         if spec.brightness_pct is not None:
             on_state = {"condition": "template", "value_template": "{{ is_state(" + quoted + ", 'off') or (is_state(" + quoted + ", 'on') and ((state_attr(" + quoted + ", 'brightness') | float(0)) / 255 * 100 - " + str(spec.brightness_pct) + ") | abs >= 1) }}"}
@@ -127,7 +149,7 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
         ]})
         for index, branch in enumerate(config["actions"][-1]["choose"]):
             reason = ("{{ 'sensor_unavailable' if not (" + valid + ") else 'outside_window' if not (" + active + ") else 'lower_threshold' }}"
-                      if sensors and index == 0 else "upper_threshold" if sensors else "time_window")
+                      if sensors and index == 0 else "upper_threshold" if sensors else "solar_schedule" if spec.uses_sun else "time_window")
             branch["sequence"].append({"event": "semantic_home_action", "event_data": {
                 "automation_id": rule_id, "entity_id": eid, "desired": "off" if index == 0 else "on", "reason": reason}})
         if device["attributes"].get("device_id"):

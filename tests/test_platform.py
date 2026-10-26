@@ -204,6 +204,45 @@ class HouseholdIntegrationTest(unittest.TestCase):
     def spec(self, device_id, **patch):
         return {"name": "Abendlicht", "kind": "time_window", "targets": [device_id], "start": "18:00", "end": "23:00", **patch}
 
+    def test_solar_schedule_persists_and_previews_only_its_connection_location(self):
+        from psycopg.types.json import Jsonb
+        ac, bc = self.connection(self.alice), self.connection(self.bob)
+        lamp = self.ingest(self.alice, ac, "light.room", "off", {"friendly_name": "Reading lamp", "supported_color_modes": ["brightness"]})[0]
+        self.app.state.db.execute("UPDATE agents SET metadata=%s WHERE id=%s", (Jsonb({"timezone": "Europe/Berlin", "location": {
+            "name": "Meckenheim", "latitude": 50.625, "longitude": 7.022, "elevation": 180}}), ac["id"]))
+        self.app.state.db.execute("UPDATE agents SET metadata=%s WHERE id=%s", (Jsonb({"timezone": "Europe/Berlin", "location": {
+            "name": "Other household", "latitude": 0, "longitude": 0}}), bc["id"]))
+        spec = self.spec(lamp["id"], start=None, start_event="sunset", start_offset_minutes=-30)
+        created = self.client.post("/api/v1/automations", headers=self.alice, json={"spec": spec})
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["status"], "draft")
+        saved = self.client.get("/api/v1/automations", headers=self.alice).json()[0]
+        self.assertEqual((saved["spec"]["start_event"], saved["spec"]["start_offset_minutes"], saved["spec"]["start"]), ("sunset", -30, None))
+        response = self.client.post("/api/v1/automations/preview", headers=self.alice, json=saved["spec"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["schedule"]["location_name"], "Meckenheim")
+        self.assertTrue(response.json()["schedule"]["events"])
+        self.assertEqual(response.json()["items"][0]["desired"], "scheduled")
+        self.assertIsNone(response.json()["window_active"])
+        self.assertEqual(self.client.post("/api/v1/automations/preview", headers=self.bob, json=spec).status_code, 422)
+        # Neither saving nor previewing queued an actual device command.
+        self.assertFalse(self.app.state.db.rule(self.ah, saved["id"])["requested"])
+
+    def test_agent_location_metadata_is_household_scoped_and_preview_is_backward_compatible(self):
+        ac = self.connection(self.alice)
+        lamp = self.ingest(self.alice, ac)[0]
+        rule = self.spec(lamp["id"], start=None, start_event="sunrise")
+        missing = self.client.post("/api/v1/automations/preview", headers=self.alice, json=rule)
+        self.assertEqual(missing.status_code, 200, missing.text)
+        self.assertFalse(missing.json()["schedule"]["available"])
+        with self.client.websocket_connect("/api/v1/ws/agent/" + ac["id"], headers={"Authorization": "Bearer " + ac["token"]}) as ws:
+            ws.send_json({"type": "metadata", "timezone": "Europe/Berlin", "location": {"name": "Home location", "latitude": 50, "longitude": 7}})
+            ws.send_json({"type": "ping"})
+            self.assertEqual(ws.receive_json()["type"], "pong")
+            own = self.client.get("/api/v1/connections", headers=self.alice).json()[0]
+            self.assertEqual(own["metadata"]["location"]["name"], "Home location")
+            self.assertEqual(self.client.get("/api/v1/connections", headers=self.bob).json(), [])
+
     def test_same_entity_ids_and_all_legacy_routes_are_isolated(self):
         ac, bc = self.connection(self.alice), self.connection(self.bob)
         ad = self.ingest(self.alice, ac, state="on")[0]

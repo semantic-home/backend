@@ -65,6 +65,10 @@ class AutomationSpec(SensorSelection):
     weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
     start: str | None = None
     end: str | None = None
+    start_event: Literal["time", "sunrise", "sunset"] = "time"
+    end_event: Literal["time", "sunrise", "sunset"] = "time"
+    start_offset_minutes: int = Field(default=0, ge=-180, le=180)
+    end_offset_minutes: int = Field(default=0, ge=-180, le=180)
     at: str = "10:00"
     min_cycle_seconds: int = Field(default=180, ge=0, le=86400)
     sensor_stale_seconds: int = Field(default=1800, ge=60, le=86400)
@@ -97,17 +101,42 @@ class AutomationSpec(SensorSelection):
     def valid_rule(self):
         if self.lower >= self.upper:
             raise ValueError("Lower humidity threshold must be below upper threshold")
-        if bool(self.start) != bool(self.end) or (self.start and self.start == self.end):
-            raise ValueError("Select distinct start and end times")
+        if self.uses_sun:
+            if self.kind != "time_window":
+                raise ValueError("Sunrise and sunset are available for lighting and power schedules")
+            for edge in ("start", "end"):
+                event, clock, offset = getattr(self, edge + "_event"), getattr(self, edge), getattr(self, edge + "_offset_minutes")
+                if event == "time" and (not clock or offset):
+                    raise ValueError("A fixed time needs a clock time and no solar offset")
+                if event != "time" and clock is not None:
+                    raise ValueError("A solar event cannot also have a fixed clock time")
+            if self.start_event == self.end_event and self.start_offset_minutes == self.end_offset_minutes:
+                raise ValueError("Select distinct switch-on and switch-off events")
+        else:
+            if self.start_offset_minutes or self.end_offset_minutes:
+                raise ValueError("Offsets require sunrise or sunset")
+            if bool(self.start) != bool(self.end) or (self.start and self.start == self.end):
+                raise ValueError("Select distinct start and end times")
         if self.kind == "humidity_band" and not self.sensor_ids:
             raise ValueError("Select at least one room humidity sensor")
         if self.kind != "humidity_band" and self.sensor_ids:
             raise ValueError("Only humidity rules use humidity sensors")
-        if self.kind == "time_window" and not self.start:
+        if self.kind == "time_window" and not self.start and not self.uses_sun:
             raise ValueError("Select a time window")
         if self.kind == "cleaning" and self.start:
             raise ValueError("Cleaning uses a start time, not a time window")
         return self
+
+    @property
+    def uses_sun(self) -> bool:
+        return self.start_event != "time" or self.end_event != "time"
+
+
+class HomeLocation(StrictModel):
+    name: str = Field(default="Home Assistant home", max_length=100)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    elevation: float = Field(default=0, ge=-500, le=10000)
 
 
 class SaveAutomation(StrictModel):

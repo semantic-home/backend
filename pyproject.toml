@@ -12,6 +12,7 @@ dependencies = [
     "scalar-fastapi>=1.6.1",
     "uvicorn[standard]>=0.40.0",
     "psycopg[binary,pool]>=3.2,<4",
+    "astral==3.2",
 ]
 
 [dependency-groups]

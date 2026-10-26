@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from psycopg.types.json import Jsonb
 
 from backend.platform.database import token_hash
+from backend.platform.models import HomeLocation
 from backend.schemas.ha_messages import EntitiesSnapshot, EntityStateUpdate
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ async def ws_agent(agent_id: str, ws: WebSocket):
             await hub.touch(agent_id)
             if kind == "metadata":
                 metadata = {key: msg[key] for key in ("timezone", "ha_version", "stub") if key in msg}
+                if msg.get("location") is not None:
+                    metadata["location"] = HomeLocation.model_validate(msg["location"]).model_dump()
                 db.execute("UPDATE agents SET metadata=%s WHERE home_id=%s AND id=%s", (Jsonb(metadata), agent["home_id"], agent_id))
             elif kind in {"entities_snapshot", "state_update"}:
                 entities = EntitiesSnapshot.model_validate(msg).entities if kind == "entities_snapshot" else [EntityStateUpdate.model_validate(msg).entity]
