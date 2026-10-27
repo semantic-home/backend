@@ -144,6 +144,34 @@ class ProgramTest(unittest.TestCase):
         guard=body[-1]['choose'][-1]['conditions'][-1]['value_template']
         self.assertFalse(self.render(guard,context))
 
+    def test_evening_curve_can_switch_on_in_the_morning_hold_then_dim_and_switch_off(self):
+        p=dusk()
+        p.timing.start=type(p.timing.start)(event='clock',at='06:00')
+        p.timing.end=type(p.timing.end)(event='clock',at='22:00')
+        p.end_action='off';p.condition_failure='off'
+        config=compile_automation(RULE,spec(p),[TARGET],[],1)
+        body=config['actions'][1]['choose'][-1]['sequence']
+        def evaluate(now,angle,rising,state,trigger):
+            context=self.context(now=now,angle=angle,rising=rising,state=state)
+            context['trigger']=SimpleNamespace(id=trigger)
+            for action in config['actions'][:1]+body[:3]:
+                for key,value in action.get('variables',{}).items():context[key]=self.render(value,context)
+            branches=body[-1]['choose']
+            return context,[self.render(b['conditions'][-1]['value_template'],context) for b in branches]
+        context,branches=evaluate(NOW.replace(hour=6),-10,True,'off','window_start')
+        self.assertEqual(context['program_brightness'],100)
+        self.assertEqual(branches,[False,True])
+        _,branches=evaluate(NOW.replace(hour=7),-6,True,'on','minute')
+        self.assertEqual(branches,[False,False])  # Hold; opposite motion is not a failed condition.
+        context,branches=evaluate(NOW.replace(hour=18),-9,False,'on','minute')
+        self.assertLess(context['program_brightness'],100)
+        self.assertEqual(branches,[False,True])
+        _,branches=evaluate(NOW.replace(hour=18),-9,False,'off','minute')
+        self.assertEqual(branches,[False,False])  # Preserve a manual switch-off.
+        end=config['actions'][1]['choose'][0]
+        context=self.context(now=NOW.replace(hour=22),state='on');context['trigger']=SimpleNamespace(id='window_end')
+        self.assertTrue(self.render(end['conditions'][0]['value_template'],context))
+
     def test_solar_curve_holds_during_the_opposite_phase(self):
         p=dusk()
         config=compile_automation(RULE,spec(p),[TARGET],[],1)
@@ -233,6 +261,12 @@ class ProgramTest(unittest.TestCase):
                 'conditions':{'kind':'all','terms':[] if matched else [{'kind':'state','device_id':'lamp','state':'off'}]}})
             result=preview_program(spec(p),[TARGET],[],METADATA,'Europe/Berlin','HA',True,NOW.replace(hour=hour))
             self.assertEqual(result['items'][0]['desired'],expected)
+
+    def test_preview_explains_when_a_runtime_limit_precedes_the_selected_end(self):
+        p=dusk();p.timing.start=type(p.timing.start)(event='clock',at='06:00')
+        result=preview_program(spec(p),[TARGET],[],METADATA,'Europe/Berlin','HA',True,NOW)
+        self.assertTrue(any('before the selected end event' in w for w in result['warnings']))
+        self.assertIn('T12:00:00',result['timeline']['stop'])
 
     def test_clock_curve_queues_its_end_edge_while_solar_loop_stays_single(self):
         p=dusk();p.timing.start=type(p.timing.start)(event='clock',at='06:00');p.timing.end=type(p.timing.end)(event='clock',at='12:00')

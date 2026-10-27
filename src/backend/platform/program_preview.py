@@ -129,6 +129,10 @@ def preview_program(spec,targets,inputs,metadata,home_timezone,connection_name,c
                 active=True
         result['events']=[{'at':at.isoformat(),'event':name} for name,at in [('start',start),('end',stop)]] if start and stop else []
         natural_end=anchor_time(p.timing.end,local.date(),zone,location,start)
+        if start and natural_end and natural_end<=start and p.timing.end.event!='elapsed':
+            natural_end=anchor_time(p.timing.end,local.date()+timedelta(days=1),zone,location,start)
+        if stop and natural_end and stop.astimezone(timezone.utc)<natural_end.astimezone(timezone.utc):
+            result['warnings'].append(f'The {p.max_run_minutes}-minute running limit ends this window before the selected end event. Change the limit in Advanced to reach that event.')
         if not start or not natural_end:
             result['warnings'].append('A selected solar event does not occur today, or its home location is missing. No substitute clock time is invented.')
         if not (p.timing.start.event==p.timing.end.event=='clock'):

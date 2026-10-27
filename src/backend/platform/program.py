@@ -190,6 +190,7 @@ def _curve_expression(control, field):
 
 def curve_body(program, targets, records, rule_id):
     control = program.control
+    following = 'true'
     if control.driver == 'sun_elevation':
         driver = "state_attr('sun.sun','elevation') | float(0)"
         valid = "is_number(state_attr('sun.sun','elevation'))"
@@ -197,7 +198,7 @@ def curve_body(program, targets, records, rule_id):
             rising='true' if control.solar_direction=='rising' else 'false'
             endpoint=max(p.position for p in control.points) if control.solar_direction=='rising' else min(p.position for p in control.points)
             op='>=' if control.solar_direction=='rising' else '<='
-            valid+=f" and (state_attr('sun.sun','rising') == {rising} or state_attr('sun.sun','elevation') | float(0) {op} {endpoint})"
+            following=f"(state_attr('sun.sun','rising') == {rising} or state_attr('sun.sun','elevation') | float(0) {op} {endpoint})"
     elif control.driver == 'measurement':
         record = records[control.sensor_id]
         driver, valid = f'states({entity(record)}) | float(0)', fresh(record,control.max_age_seconds)
@@ -224,7 +225,7 @@ def curve_body(program, targets, records, rule_id):
         if caps.get('transition'):
             data['transition']=template('0 if program_first else 60')
         guards=identity_condition(device)+[{'condition':'template','value_template':template(
-            f"({valid}) and ({gates}) and {allowed} and ({initial} or {changed}) and states({q}) in ['on','off']")}]
+            f"({valid}) and ({gates}) and ({initial} or {following}) and {allowed} and ({initial} or {changed}) and states({q}) in ['on','off']")}]
         branches=[{'conditions':guards,'sequence':[{'action':'light.turn_on','target':{'entity_id':device['entity_id']},'data':data,'continue_on_error':True},event(rule_id,device,'on','program_curve')]}]
         if program.condition_failure == 'off':
             from .program_models import SetStep
