@@ -42,6 +42,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --group dev
 
+      - name: Test deployment connection scripts
+        run: python3 .github/scripts/test_deploy_wireguard.py
+
       - name: Run tests
         run: uv run python -m unittest discover -s tests
 
@@ -51,8 +54,9 @@ jobs:
     outputs:
       version_tag: ${{ steps.image.outputs.version_tag }}
     if: >
-      github.ref_type == 'tag' ||
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      github.event_name != 'workflow_dispatch' &&
+      (github.ref_type == 'tag' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     permissions:
       contents: read
     steps:
@@ -103,10 +107,12 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: publish_image
     if: >
-      github.ref_type == 'tag' ||
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      github.event_name != 'workflow_dispatch' &&
+      (github.ref_type == 'tag' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     environment:
       name: production
     concurrency:
@@ -115,27 +121,66 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Configure SSH
-        env:
-          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-        run: |
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Deploy backend on server
+      - name: Install WireGuard tools
+        run: |
+          if ! command -v wg-quick >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends wireguard-tools
+          fi
+
+      - name: Connect deployment VPN
+        env:
+          DEPLOY_WIREGUARD_CONFIG: ${{ secrets.DEPLOY_WIREGUARD_CONFIG }}
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: bash .github/scripts/deploy-wireguard.sh up backend
+
+      - name: Verify VPN and SSH permissions
+        run: bash .github/scripts/deploy-wireguard.sh check backend
+
+      - name: Deploy backend on server through VPN
         env:
           DEPLOY_TAG: ${{ needs.publish_image.outputs.version_tag }}
+        run: bash .github/scripts/deploy-wireguard.sh deploy backend
+
+      - name: Close deployment VPN
+        if: always()
+        run: bash .github/scripts/deploy-wireguard.sh down backend
+
+  verify_deployment_connection:
+    name: Verify VPN deployment access
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+    concurrency:
+      group: backend-production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install WireGuard tools
         run: |
-          printf '%s\n' "$DEPLOY_TAG" | ssh \
-            -i ~/.ssh/id_ed25519 \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=~/.ssh/known_hosts \
-            -p "${{ secrets.DEPLOY_PORT }}" \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            -- sudo /opt/home-automation/bin/deploy-backend.sh
+          if ! command -v wg-quick >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends wireguard-tools
+          fi
+
+      - name: Connect deployment VPN
+        env:
+          DEPLOY_WIREGUARD_CONFIG: ${{ secrets.DEPLOY_WIREGUARD_CONFIG }}
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: bash .github/scripts/deploy-wireguard.sh up backend
+
+      - name: Verify VPN and SSH permissions
+        run: bash .github/scripts/deploy-wireguard.sh check backend
+
+      - name: Close deployment VPN
+        if: always()
+        run: bash .github/scripts/deploy-wireguard.sh down backend
