@@ -179,8 +179,8 @@ def compile_steps(steps, targets, records, rule_id):
     return result
 
 
-def _curve_expression(control, field):
-    points = sorted(control.points,key=lambda p:p.position)
+def _curve_expression(control, field, points=None):
+    points = sorted(control.points if points is None else points,key=lambda p:p.position)
     expression = str(getattr(points[-1],field))
     for a,b in reversed(list(zip(points,points[1:]))):
         segment = f'({getattr(a,field)} + ({getattr(b,field)} - {getattr(a,field)}) * (program_input - {a.position}) / ({b.position} - {a.position}))'
@@ -188,12 +188,14 @@ def _curve_expression(control, field):
     return f'({getattr(points[0],field)} if program_input <= {points[0].position} else {expression})'
 
 
-def curve_body(program, targets, records, rule_id):
+def curve_body(program, targets, records, rule_id, finishing=False):
     control = program.control
     following = 'true'
     if control.driver == 'sun_elevation':
         driver = "state_attr('sun.sun','elevation') | float(0)"
         valid = "is_number(state_attr('sun.sun','elevation'))"
+        if control.evening_points is not None:
+            valid += " and state_attr('sun.sun','rising') in [true,false]"
         if control.solar_direction!='any':
             rising='true' if control.solar_direction=='rising' else 'false'
             endpoint=max(p.position for p in control.points) if control.solar_direction=='rising' else min(p.position for p in control.points)
@@ -205,11 +207,17 @@ def curve_body(program, targets, records, rule_id):
     else:
         driver, valid = 'program_elapsed', 'true'
     gates = condition_expression(program.conditions,records)
+    def level(field):
+        morning = _curve_expression(control,field)
+        if control.evening_points is None:
+            return morning
+        evening = _curve_expression(control,field,control.evening_points)
+        return f"({evening} if state_attr('sun.sun','rising') == false else {morning})"
     startup = f'[1, program_elapsed / {control.startup_minutes}] | min' if control.startup_minutes else '1'
     result = [{'variables':{'program_elapsed':template('[0,(as_timestamp(now()) - program_started) / 60] | max')}},
               {'variables':{'program_input':template(driver),'program_blend':template(startup)}},
-              {'variables':{'program_brightness':template(f"({control.initial_brightness_pct} if program_first else ({control.initial_brightness_pct} + ({_curve_expression(control,'brightness_pct')} - {control.initial_brightness_pct}) * program_blend)) | round(0) | int"),
-                            'program_kelvin':template(f"({control.initial_kelvin} if program_first else ({control.initial_kelvin} + ({_curve_expression(control,'kelvin')} - {control.initial_kelvin}) * program_blend)) | round(0) | int")}}]
+              {'variables':{'program_brightness':template(f"({control.initial_brightness_pct} if program_first else ({control.initial_brightness_pct} + ({level('brightness_pct')} - {control.initial_brightness_pct}) * program_blend)) | round(0) | int"),
+                            'program_kelvin':template(f"({control.initial_kelvin} if program_first else ({control.initial_kelvin} + ({level('kelvin')} - {control.initial_kelvin}) * program_blend)) | round(0) | int")}}]
     for device in targets:
         q = entity(device)
         caps = infer_capabilities(device['entity_id'], device['attributes'])
@@ -223,7 +231,7 @@ def curve_body(program, targets, records, rule_id):
             data['color_temp_kelvin']=template(clamped)
             changed+=f" or ((state_attr({q},'color_temp_kelvin') | float(0) - {clamped}) | abs >= 25)"
         if caps.get('transition'):
-            data['transition']=template('0 if program_first else 60')
+            data['transition']=0 if finishing else template('0 if program_first else 60')
         guards=identity_condition(device)+[{'condition':'template','value_template':template(
             f"({valid}) and ({gates}) and ({initial} or {following}) and {allowed} and ({initial} or {changed}) and states({q}) in ['on','off']")}]
         branches=[{'conditions':guards,'sequence':[{'action':'light.turn_on','target':{'entity_id':device['entity_id']},'data':data,'continue_on_error':True},event(rule_id,device,'on','program_curve')]}]
@@ -371,4 +379,9 @@ def compile_program(config, rule_id, spec, targets, inputs):
     if p.end_action=='off':
         from .program_models import SetStep
         config['actions'].extend(set_actions(SetStep(action='turn_off'),targets,rule_id,'program_finished'))
+    elif c.kind=='curve':
+        # Apply the actual ending sample, rather than leaving the previous minute's
+        # level. Keep all identity, availability, condition and manual-off guards.
+        config['actions'].append({'choose':[{'conditions':[{'condition':'template','value_template':template('not program_first')}],
+                                           'sequence':curve_body(p,targets,records,rule_id,finishing=True)}]})
     return config

@@ -202,6 +202,7 @@ class CurveControl(ProgramModel):
     max_age_seconds: int = Field(default=1800, ge=60, le=86400)
     color_mode: Literal['brightness', 'white'] = 'white'
     points: list[CurvePoint] = Field(min_length=2, max_length=16)
+    evening_points: list[CurvePoint] | None = Field(default=None, min_length=2, max_length=16)
     initial_brightness_pct: int = Field(default=1, ge=1, le=100)
     initial_kelvin: int = Field(default=2702, ge=1000, le=10000)
     startup_minutes: int = Field(default=0, ge=0, le=120)
@@ -209,15 +210,18 @@ class CurveControl(ProgramModel):
 
     @model_validator(mode='after')
     def valid_curve(self):
-        positions = [p.position for p in self.points]
-        if len(set(positions)) != len(positions):
-            raise ValueError('Curve points need distinct input values')
+        if self.evening_points is not None and (self.driver != 'sun_elevation' or self.solar_direction != 'any'):
+            raise ValueError('Separate evening points require morning and evening solar control')
         if (self.driver == 'measurement') != bool(self.sensor_id):
             raise ValueError('Choose a measurement only for a measurement-driven curve')
-        if self.driver == 'sun_elevation' and any(not -90 <= x <= 90 for x in positions):
-            raise ValueError('Sun elevation must be between -90 and 90 degrees')
-        if self.driver == 'elapsed_minutes' and any(not 0 <= x <= 1440 for x in positions):
-            raise ValueError('Elapsed curve points use 0–1440 minutes')
+        for points in [self.points] + ([self.evening_points] if self.evening_points is not None else []):
+            positions = [p.position for p in points]
+            if len(set(positions)) != len(positions):
+                raise ValueError('Curve points need distinct input values within each profile')
+            if self.driver == 'sun_elevation' and any(not -90 <= x <= 90 for x in positions):
+                raise ValueError('Sun elevation must be between -90 and 90 degrees')
+            if self.driver == 'elapsed_minutes' and any(not 0 <= x <= 1440 for x in positions):
+                raise ValueError('Elapsed curve points use 0–1440 minutes')
         return self
 
 

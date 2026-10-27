@@ -77,8 +77,8 @@ def _conditions_met(condition,records,now):
             'at_least':value>=condition.value,'at_most':value<=condition.value}[condition.comparison]
 
 
-def curve_value(control,value,elapsed):
-    points=sorted(control.points,key=lambda p:p.position)
+def curve_value(control,value,elapsed,rising=True):
+    points=sorted(control.evening_points if control.evening_points is not None and not rising else control.points,key=lambda p:p.position)
     a=b=points[0] if value<=points[0].position else points[-1]
     for left,right in zip(points,points[1:]):
         if left.position<=value<=right.position:
@@ -151,9 +151,9 @@ def preview_program(spec,targets,inputs,metadata,home_timezone,connection_name,c
             for offset in offsets:
                 at=(start.astimezone(timezone.utc)+timedelta(seconds=offset)).astimezone(zone)
                 value=elevation(observer,at) if c.driver=='sun_elevation' else measurement['value'] if measurement else offset/60
-                levels=curve_value(c,value,offset/60)
+                rising=elevation(observer,at+timedelta(seconds=30))>=value if c.driver=='sun_elevation' else True
+                levels=curve_value(c,value,offset/60,rising=rising)
                 if c.driver=='sun_elevation' and c.solar_direction!='any':
-                    rising=elevation(observer,at+timedelta(seconds=30))>=value
                     endpoint=max(pt.position for pt in c.points) if c.solar_direction=='rising' else min(pt.position for pt in c.points)
                     following=(rising or value>=endpoint) if c.solar_direction=='rising' else (not rising or value<=endpoint)
                     if not following and previous is not None:

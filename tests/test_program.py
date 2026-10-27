@@ -183,6 +183,75 @@ class ProgramTest(unittest.TestCase):
         guard=body[3]['choose'][-1]['conditions'][-1]['value_template']
         self.assertFalse(self.render(guard,context))
 
+    def test_separate_evening_curve_uses_its_own_levels_and_preserves_the_morning(self):
+        p=dusk();p.control.solar_direction='any';p.control.startup_minutes=0
+        p.control.evening_points=copy.deepcopy(p.control.points)
+        for point in p.control.evening_points:
+            point.brightness_pct=round(45+(point.brightness_pct-1)*55/99)
+            point.kelvin=3000
+        original=copy.deepcopy(p.control.points)
+        config=compile_automation(RULE,spec(p),[TARGET],[],1)
+        body=config['actions'][2]['repeat']['sequence']
+        for rising,angle,expected,kelvin in [(True,-25,1,2702),(False,-25,45,3000),(True,-9,28,3500),(False,-9,60,3000)]:
+            context=self.context(angle=angle,rising=rising)
+            context.update(program_started=NOW.timestamp()-3600,program_first=False)
+            for action in body[:3]:
+                for key,value in action.get('variables',{}).items():context[key]=self.render(value,context)
+            self.assertEqual(context['program_brightness'],expected)
+            self.assertEqual(context['program_kelvin'],kelvin)
+        unknown=self.context(angle=-25,rising=None)
+        unknown.update({k:v for k,v in context.items() if k.startswith('program_')})
+        self.assertFalse(self.render(body[3]['choose'][-1]['conditions'][-1]['value_template'],unknown))
+        self.assertEqual(p.control.points,original)
+        self.assertEqual(AutomationProgram.model_validate(p.model_dump()),p)
+
+    def test_separate_profiles_reject_invalid_or_non_solar_evening_points(self):
+        base=dusk().model_dump();control=base['control'];control['solar_direction']='any'
+        control['evening_points']=copy.deepcopy(control['points'])
+        for patch in [
+            {'solar_direction':'setting'}, {'driver':'elapsed_minutes'},
+            {'evening_points':control['points'][:1]},
+            {'evening_points':[control['points'][0],control['points'][0]]},
+            {'evening_points':[{**control['points'][0],'position':-91},control['points'][1]]},
+            {'evening_points':[{**control['points'][0],'brightness_pct':0},control['points'][1]]},
+        ]:
+            with self.subTest(patch=patch),self.assertRaises(ValueError):
+                AutomationProgram.model_validate({**base,'control':{**control,**patch}})
+
+    def test_solar_hold_applies_the_ending_level_without_reviving_a_manual_off_lamp(self):
+        p=dusk();p.control.startup_minutes=0
+        for point in p.control.points:point.brightness_pct=max(45,point.brightness_pct)
+        config=compile_automation(RULE,spec(p),[TARGET],[],1)
+        final=config['actions'][-1]['choose'][0]
+        context=self.context(angle=-20.1,rising=False)
+        context.update(program_started=NOW.timestamp()-7200,program_first=False)
+        self.assertTrue(self.render(final['conditions'][0]['value_template'],context))
+        body=final['sequence']
+        for action in body[:3]:
+            for key,value in action.get('variables',{}).items():context[key]=self.render(value,context)
+        self.assertEqual(context['program_brightness'],45)
+        self.assertTrue(self.render(body[-1]['choose'][-1]['conditions'][-1]['value_template'],context))
+        self.assertEqual(body[-1]['choose'][-1]['sequence'][0]['data']['transition'],0)
+        off=self.context(angle=-20.1,rising=False,state='off')
+        off.update({k:v for k,v in context.items() if k.startswith('program_')})
+        self.assertFalse(self.render(body[-1]['choose'][-1]['conditions'][-1]['value_template'],off))
+        context['program_first']=True
+        self.assertFalse(self.render(final['conditions'][0]['value_template'],context))
+
+    def test_preview_follows_independent_morning_and_evening_profiles_and_holds_45(self):
+        p=dusk();p.control.solar_direction='any';p.control.startup_minutes=0
+        p.control.evening_points=copy.deepcopy(p.control.points)
+        for point in p.control.evening_points:point.brightness_pct=max(45,point.brightness_pct)
+        p.timing.start=type(p.timing.start)(event='clock',at='06:00')
+        p.timing.end=type(p.timing.end)(event='clock',at='22:00')
+        p.control.initial_brightness_pct=1
+        result=preview_program(spec(p),[TARGET],[],METADATA,'Europe/Berlin','HA',True,NOW)
+        samples=result['timeline']['samples']
+        self.assertEqual(samples[0]['brightness_pct'],1)
+        self.assertEqual(samples[-1]['brightness_pct'],45)
+        self.assertTrue(any(s['brightness_pct']==100 for s in samples))
+        self.assertTrue(all(s['brightness_pct']==45 for s in samples if s['at']>='2026-10-27T20:00:00+01:00'))
+
     def test_elapsed_and_measurement_curves_use_the_same_control(self):
         for driver,inputs in [('elapsed_minutes',[]),('measurement',[sensor('living',50)])]:
             p=dusk();p.control.driver=driver;p.control.sensor_id='living' if inputs else None;p.control.solar_direction='any';p.control.startup_minutes=0
