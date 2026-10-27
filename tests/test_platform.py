@@ -205,6 +205,83 @@ class HouseholdIntegrationTest(unittest.TestCase):
     def spec(self, device_id, **patch):
         return {"name": "Abendlicht", "kind": "time_window", "targets": [device_id], "start": "18:00", "end": "23:00", **patch}
 
+    def test_reusable_program_roundtrips_and_rejects_foreign_or_cross_connection_inputs(self):
+        ac,bc=self.connection(self.alice),self.connection(self.bob)
+        target=self.ingest(self.alice,ac,'light.program','off',{'supported_color_modes':['brightness']})[0]
+        own=self.ingest(self.alice,ac,'binary_sensor.motion','off',{'friendly_name':'Own motion'})
+        own=next(d for d in own if d['entity_id']=='binary_sensor.motion')
+        foreign=self.ingest(self.bob,bc,'binary_sensor.motion','off')[0]
+        second=self.connection(self.alice)
+        other=self.ingest(self.alice,second,'binary_sensor.motion','off')[0]
+        body={'name':'Motion and time','kind':'program','targets':[target['id']],'program':{'version':2,
+              'timing':{'mode':'events','triggers':[{'kind':'state','key':'motion','device_id':own['id'],'state':'on'}]},
+              'conditions':{'kind':'all','terms':[{'kind':'clock','start':'18:00','end':'23:00'}]},
+              'control':{'kind':'sequence','steps':[{'kind':'set','brightness_pct':30},{'kind':'wait','seconds':20},{'kind':'set','action':'turn_off'}]}}}
+        response=self.client.post('/api/v1/automations',headers=self.alice,json={'spec':body})
+        self.assertEqual(response.status_code,200,response.text)
+        saved=response.json()
+        self.assertFalse(saved['requested']);self.assertEqual(saved['spec']['program']['version'],2)
+        preview=self.client.post('/api/v1/automations/preview',headers=self.alice,json=body)
+        self.assertEqual(preview.status_code,200,preview.text)
+        self.assertIn('program',preview.json())
+        for device in (foreign,other):
+            changed={**body,'program':{**body['program'],'timing':{'mode':'events','triggers':[{'kind':'state','device_id':device['id'],'state':'on'}]}}}
+            self.assertEqual(self.client.post('/api/v1/automations/preview',headers=self.alice,json=changed).status_code,422)
+            self.assertEqual(self.client.post('/api/v1/automations',headers=self.alice,json={'spec':changed}).status_code,422)
+        self.assertEqual(self.client.post('/api/v1/automations/preview',headers=self.bob,json=body).status_code,422)
+
+    def test_unused_controller_inputs_are_validated_but_do_not_block_program_execution(self):
+        from backend.platform.models import AutomationSpec
+        controller,body,connection=self.humidity_controller()
+        data={'name':'Timed plug','kind':'program','targets':body['targets'],'sensor_ids':[body['sensor_id']],
+              'program':{'timing':{'mode':'always'},'control':{'kind':'switch'}}}
+        targets,inputs,agent_id=self.app.state.automations.bindings(self.ah,AutomationSpec.model_validate(data))
+        self.assertEqual(inputs,[])
+        self.assertEqual(agent_id,connection['id'])
+        foreign_connection=self.connection(self.bob)
+        foreign=self.ingest(self.bob,foreign_connection,'sensor.foreign','55',{'device_class':'humidity','unit_of_measurement':'%'})[0]
+        response=self.client.post('/api/v1/automations/preview',headers=self.alice,json={**data,'sensor_ids':[foreign['id']]})
+        self.assertEqual(response.status_code,422,response.text)
+
+    def test_generic_range_inputs_and_stale_status_are_visible_on_the_controller(self):
+        from datetime import timedelta
+        ac=self.connection(self.alice)
+        self.ingest(self.alice,ac,'switch.range','off',{'friendly_name':'Range output'})
+        self.ingest(self.alice,ac,'sensor.first','20',{'unit_of_measurement':'°C','device_class':'temperature','_ha_last_updated':datetime.now(timezone.utc).isoformat()})
+        inventory=self.ingest(self.alice,ac,'sensor.second','22',{'unit_of_measurement':'°C','device_class':'temperature','_ha_last_updated':datetime.now(timezone.utc).isoformat()})
+        by_entity={d['entity_id']:d for d in inventory}
+        output=by_entity['switch.range'];first=by_entity['sensor.first'];second=by_entity['sensor.second']
+        controller=self.client.post('/api/v1/domains/power/controllers',headers=self.alice,json={'display_name':'Heating','zone_id':'unassigned','targets':[output['id']]}).json()
+        program={'version':2,'timing':{'mode':'always'},'end_action':'off','control':{'kind':'band','sensor_ids':[first['id'],second['id']],'aggregation':'average','demand':'below','lower':22,'upper':24}}
+        body={'name':'Maintain temperature','kind':'program','targets':[output['id']],'program':program}
+        response=self.client.post('/api/v1/automations',headers=self.alice,json={'spec':body,'controller_id':controller['controller_id']})
+        self.assertEqual(response.status_code,200,response.text)
+        saved=response.json()
+        preview=self.client.post('/api/v1/automations/preview',headers=self.alice,json=body)
+        self.assertEqual(preview.status_code,200,preview.text)
+        self.assertEqual(preview.json()['program']['aggregate'],21)
+        self.assertEqual(preview.json()['items'][0]['desired'],'on')
+        self.app.state.db.execute("UPDATE automations SET deployed_spec=spec,deployed_version=version,status='active' WHERE id=%s",(saved['id'],))
+        self.ingest(self.alice,ac,'sensor.second','22',{'unit_of_measurement':'°C','device_class':'temperature','_ha_last_updated':(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()})
+        view=self.client.get('/api/v1/domains/power/controllers/'+controller['controller_id'],headers=self.alice)
+        self.assertEqual(view.status_code,200,view.text)
+        measurements={e['device_id']:e['measurement'] for e in view.json()['entities'] if e['measurement']}
+        self.assertFalse(measurements[second['id']]['valid']);self.assertEqual(measurements[second['id']]['issue'],'stale')
+        self.assertTrue(measurements[first['id']]['valid'])
+        preview=self.client.post('/api/v1/automations/preview',headers=self.alice,json=body)
+        self.assertEqual(preview.json()['items'][0]['desired'],'off')
+        self.assertEqual(preview.json()['items'][0]['reason'],'sensor_unavailable')
+
+    def test_program_actions_cannot_target_unassigned_outputs(self):
+        ac=self.connection(self.alice)
+        first=self.ingest(self.alice,ac,'switch.first')[0]
+        inventory=self.ingest(self.alice,ac,'switch.second')
+        second=next(d for d in inventory if d['entity_id']=='switch.second')
+        rule={'name':'Out-of-controller action','kind':'program','targets':[first['id']],
+              'program':{'timing':{'mode':'events','triggers':[{'kind':'anchor','anchor':{'event':'clock','at':'08:00'}}]},'control':{'kind':'sequence','steps':[{'kind':'set','targets':[second['id']]}]}}}
+        self.assertEqual(self.client.post('/api/v1/automations',headers=self.alice,json={'spec':rule}).status_code,422)
+        self.assertEqual(self.client.post('/api/v1/automations/preview',headers=self.alice,json=rule).status_code,422)
+
     def test_solar_schedule_persists_and_previews_only_its_connection_location(self):
         from psycopg.types.json import Jsonb
         ac, bc = self.connection(self.alice), self.connection(self.bob)

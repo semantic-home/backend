@@ -181,7 +181,7 @@ async def rotate_connection(agent_id: str, request: Request):
 @router.get("/devices")
 def devices(request: Request, q: str = Query(default="", max_length=100), area: str | None = None,
             agent_id: str | None = None,
-            capability: str | None = Query(default=None, pattern="^(humidity|switching|cleaning)$"),
+            capability: str | None = Query(default=None, pattern="^(humidity|switching|cleaning|measurement)$"),
             offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200)):
     db, home_id = request.app.state.db, request.state.home["id"]
     where, params = "d.home_id=%s AND NOT a.revoked", [home_id]
@@ -201,6 +201,8 @@ def devices(request: Request, q: str = Query(default="", max_length=100), area: 
         where += " AND split_part(d.entity_id,'.',1) IN ('switch','light','humidifier')"
     elif capability == "cleaning":
         where += " AND split_part(d.entity_id,'.',1)='vacuum'"
+    elif capability == 'measurement':
+        where += " AND split_part(d.entity_id,'.',1)='sensor'"
     total = db.one("SELECT count(*) AS n FROM devices d JOIN agents a ON a.id=d.agent_id WHERE " + where, params)["n"]
     rows = db.all("SELECT d.*,a.name AS connection_name FROM devices d JOIN agents a ON a.id=d.agent_id WHERE " + where +
                   " ORDER BY lower(coalesce(d.attributes->>'friendly_name',d.entity_id)),d.id LIMIT %s OFFSET %s", [*params, limit, offset])

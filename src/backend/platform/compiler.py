@@ -79,6 +79,9 @@ def compile_automation(rule_id: str, spec: AutomationSpec, targets: list[dict], 
     if spec.kind == "lighting_ramp":
         from .lighting import compile_ramp
         return compile_ramp(config, rule_id, spec, targets)
+    if spec.kind == 'program':
+        from .program import compile_program
+        return compile_program(config,rule_id,spec,targets,sensors)
     if spec.kind == "cleaning":
         config["triggers"] = [{"trigger": "time", "at": spec.at + ":00"}]
         config["conditions"] = [{"condition": "template", "value_template": "{{ " + _window(spec) + " }}"}]

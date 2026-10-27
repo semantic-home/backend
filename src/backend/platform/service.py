@@ -11,6 +11,7 @@ from .compiler import compile_automation
 from .models import AutomationSpec
 from .solar import solar_preview
 from .lighting import ramp_preview
+from .program_models import input_ids
 
 
 class AutomationService:
@@ -24,7 +25,8 @@ class AutomationService:
         targets = [by_id.get(target) for target in spec.targets]
         if any(d is None for d in targets):
             raise HTTPException(422, "A selected device does not belong to this household")
-        sensors = [self.db.device(home_id, sensor_id) for sensor_id in spec.sensor_ids]
+        sensor_ids=list(dict.fromkeys(spec.sensor_ids+(input_ids(spec.program) if spec.program else [])))
+        sensors = [self.db.device(home_id, sensor_id) for sensor_id in sensor_ids]
         if any(sensor is None for sensor in sensors):
             raise HTTPException(422, "A selected sensor does not belong to this household")
         if spec.kind == "humidity_band" and (not sensors or any(sensor["attributes"].get("device_class") != "humidity"
@@ -33,6 +35,13 @@ class AutomationService:
         agents = {d["agent_id"] for d in targets + sensors}
         if len(agents) != 1:
             raise HTTPException(422, "One local rule must use devices from the same Home Assistant connection")
+        if spec.kind == 'program':
+            from .program import validate_capabilities
+            validate_capabilities(spec.program,targets,{d['id']:d for d in sensors})
+            # Validate all controller bindings, but only inputs actually read by
+            # this program participate in availability checks and triggers.
+            used=set(input_ids(spec.program))
+            return targets,[d for d in sensors if d['id'] in used],next(iter(agents))
         for d in targets:
             caps = infer_capabilities(d["entity_id"], d["attributes"])
             actions = caps.get("actions", [])
@@ -115,6 +124,13 @@ class AutomationService:
                                 or spec.ramp.stop_at < previous.ramp.start_at
                                 or previous.ramp.stop_at < spec.ramp.start_at):
                             continue
+                    if 'program' in {spec.kind,other.get('kind')}:
+                        from .program_conflicts import separated
+                        target=self.db.device(home_id,spec.targets[0])
+                        agent=self.db.agent(home_id,target['agent_id'])
+                        home=self.db.one('SELECT timezone FROM homes WHERE id=%s',(home_id,))
+                        if separated(spec,AutomationSpec.model_validate(other),agent['metadata'],home['timezone'],datetime.now(timezone.utc)):
+                            continue
                     raise HTTPException(409, f"Pause the overlapping automation first: {other['name']}")
         # Preserve ownership of actuators already assigned to the watering runtime.
         target_ids = {d["entity_id"] for d in self.db.all("SELECT entity_id FROM devices WHERE home_id=%s AND id=ANY(%s)", (home_id, spec.targets))}
@@ -131,6 +147,12 @@ class AutomationService:
         from .compiler import humidity_decision, window_active
         targets, sensors, agent_id = self.bindings(home["id"], spec)
         now = datetime.now(timezone.utc)
+        if spec.kind == 'program':
+            from .program_preview import preview_program
+            agent=self.db.agent(home['id'],agent_id)
+            result=preview_program(spec,targets,sensors,agent['metadata'],home['timezone'],agent['name'],self.hub.is_connected(agent_id),now)
+            return {'items':result['items'],'humidity':None,'timezone':home['timezone'],'program':result,
+                    'agent_id':agent_id,'note':'Preview sends no commands.'}
         value = None
         readings = []
         for sensor in sensors:

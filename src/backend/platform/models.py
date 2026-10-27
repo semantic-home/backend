@@ -5,6 +5,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from .program_models import AutomationProgram
 
 
 class StrictModel(BaseModel):
@@ -98,7 +99,8 @@ class DawnRamp(StrictModel):
 
 class AutomationSpec(SensorSelection):
     name: str = Field(min_length=1, max_length=100)
-    kind: Literal["humidity_band", "time_window", "cleaning", "lighting_ramp"]
+    kind: Literal["humidity_band", "time_window", "cleaning", "lighting_ramp", "program"]
+    program: AutomationProgram | None = None
     targets: list[str] = Field(min_length=1)
     lower: float = Field(default=52, ge=0, le=100)
     upper: float = Field(default=55, ge=0, le=100)
@@ -140,6 +142,12 @@ class AutomationSpec(SensorSelection):
 
     @model_validator(mode="after")
     def valid_rule(self):
+        if self.kind == 'program':
+            if self.program is None or self.ramp is not None or self.start or self.end or self.uses_sun or self.brightness_pct is not None or self.start_offset_minutes or self.end_offset_minutes:
+                raise ValueError('A reusable rule uses its program timing and behaviour')
+            return self
+        if self.program is not None:
+            raise ValueError('Program settings require a reusable rule')
         if self.kind == "lighting_ramp":
             if self.ramp is None or self.start or self.end or self.uses_sun or self.start_offset_minutes or self.end_offset_minutes or self.brightness_pct is not None:
                 raise ValueError("A lighting ramp uses its own start, stop and light levels")

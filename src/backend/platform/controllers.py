@@ -4,6 +4,9 @@ from psycopg.types.json import Jsonb
 
 from .database import uid
 from .models import AutomationSpec, SensorSelection
+from .measurements import measurement_limits, measurement_status
+from .program_models import AutomationProgram, input_ids
+from backend.semantic.capabilities import infer_capabilities
 
 KINDS = {"humidity": "humidity_band", "lighting": "time_window", "power": "time_window", "cleaning": "cleaning"}
 
@@ -45,7 +48,7 @@ def normalized_bindings(controller):
 
 def check_rule_binding(controller, spec):
     bindings = normalized_bindings(controller)
-    allowed = {KINDS[controller["domain"]]} | ({"lighting_ramp"} if controller["domain"] == "lighting" else set())
+    allowed = {KINDS[controller["domain"]], 'program'} | ({"lighting_ramp"} if controller["domain"] == "lighting" else set())
     if (spec.kind not in allowed or spec.targets != bindings["targets"]
             or set(spec.sensor_ids) != set(bindings["sensor_ids"])):
         raise HTTPException(422, "Rule entities and purpose must match the controller. Edit the controller to change entity roles.")
@@ -67,15 +70,27 @@ def create_from_spec(db, home_id, spec, agent_id):
 
 def view(db, controller):
     bindings = normalized_bindings(controller)
+    rules = db.all("SELECT id,spec,status,error,requested,deployed_spec FROM automations WHERE home_id=%s AND controller_id=%s AND status<>'deleted' ORDER BY updated_at DESC", (controller["home_id"], controller["id"]))
     ids = bindings["targets"] + bindings["sensor_ids"]
+    limits={}
+    for rule in rules:
+        current=rule.get('deployed_spec') or rule['spec']
+        if current.get('program'):
+            ids+=input_ids(AutomationProgram.model_validate(current['program']))
+        if current.get('enabled') and rule['status'] in {'active','pending','error'}:
+            for key,seconds in measurement_limits(current).items():
+                limits[key]=min(limits.get(key,86400),seconds)
+    ids=list(dict.fromkeys(ids))
     devices = {d["id"]: d for d in db.all("SELECT d.*,a.revoked FROM devices d JOIN agents a ON a.id=d.agent_id WHERE d.home_id=%s AND d.id=ANY(%s)", (controller["home_id"], ids))}
     roles = []
     for device_id in ids:
         d = devices.get(device_id)
         if d:
-            role = "humidity_sensor" if device_id in bindings["sensor_ids"] else {"humidity": "dehumidifier_power", "lighting": "lighting_output", "power": "power_output", "cleaning": "cleaner"}[controller["domain"]]
+            role = ("humidity_sensor" if device_id in bindings["sensor_ids"] else 'rule_input' if device_id not in bindings['targets'] else
+                    {"humidity": "dehumidifier_power", "lighting": "lighting_output", "power": "power_output", "cleaning": "cleaner"}[controller["domain"]])
             roles.append({"device_id": device_id, "entity_id": d["entity_id"], "name": d["attributes"].get("friendly_name") or d["entity_id"],
-                          "role": role, "state": d["state"], "unit": d["attributes"].get("unit_of_measurement"), "available": d["available"] and not d["revoked"]})
-    rules = db.all("SELECT id,spec,status,error,requested,deployed_spec FROM automations WHERE home_id=%s AND controller_id=%s AND status<>'deleted' ORDER BY updated_at DESC", (controller["home_id"], controller["id"]))
+                          "role": role, "state": d["state"], "unit": d["attributes"].get("unit_of_measurement"), "available": d["available"] and not d["revoked"],
+                          'measurement':measurement_status({**d,'available':d['available'] and not d['revoked']},limits[device_id]) if device_id in limits else None})
+            roles[-1]['capabilities']=infer_capabilities(d['entity_id'],d['attributes'])
     return {**controller, "bindings": bindings, "controller_id": controller["id"], "zone": {"zone_id": controller["zone_id"], "display_name": controller["zone_name"]},
             "entities": roles, "rules": rules, "rule_count": len(rules)}
