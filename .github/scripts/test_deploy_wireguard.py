@@ -12,7 +12,7 @@ SCRIPT = Path(__file__).with_name('deploy-wireguard.sh')
 KEY = base64.b64encode(bytes(range(32))).decode()
 CONFIG = f'''[Interface]
 PrivateKey = {KEY}
-Address = 10.8.0.240/32
+Address = 10.254.239.240/32
 MTU = 1280
 [Peer]
 PublicKey = {KEY}
@@ -62,7 +62,7 @@ if 'latest-handshakes' in sys.argv:
 
     def test_rejects_hooks_and_network_wide_routes_before_privileged_commands(self):
         for value in (CONFIG + 'PostUp = touch /tmp/not-allowed\n', CONFIG.replace('AllowedIPs = 10.8.0.1/32', 'AllowedIPs = 0.0.0.0/0'),
-                      CONFIG.replace('Address = 10.8.0.240/32', 'Address = 10.8.0.240/24')):
+                      CONFIG.replace('Address = 10.254.239.240/32', 'Address = 10.254.239.240/24')):
             with self.subTest(config=value):
                 self.assertNotEqual(self.run_script('up', DEPLOY_WIREGUARD_CONFIG=value).returncode, 0)
                 self.assertEqual(self.calls(), [])

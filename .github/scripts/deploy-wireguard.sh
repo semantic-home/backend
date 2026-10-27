@@ -55,7 +55,8 @@ for value in (interface['PrivateKey'], peer['PublicKey']):
     if len(base64.b64decode(value, validate=True)) != 32:
         raise SystemExit('Invalid VPN key')
 address = ipaddress.IPv4Interface(interface['Address'])
-if address.network.prefixlen != 32 or address.ip not in ipaddress.ip_network('10.8.0.0/24') or address.ip == ipaddress.ip_address('10.8.0.1'):
+private_ranges = [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+if address.network.prefixlen != 32 or not any(address.ip in n for n in private_ranges) or address.ip == ipaddress.ip_address('10.8.0.1'):
     raise SystemExit('Expected a dedicated CI /32 address')
 if peer['AllowedIPs'] != '10.8.0.1/32' or interface['MTU'] != '1280' or peer['PersistentKeepalive'] != '25':
     raise SystemExit('Expected host-only VPN routing')
